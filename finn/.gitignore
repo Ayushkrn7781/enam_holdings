@@ -1,0 +1,11 @@
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/data/*.db*
+backend/data/docs/
+.env
+.DS_Store
+
+# backend/seed/ IS committed: it is the prebuilt demo snapshot used by the Vercel function
