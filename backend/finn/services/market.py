@@ -1,54 +1,48 @@
-"""End-of-day market maths: returns, volume ratios, reaction to an event date. EOD only — never real-time."""
+"""End-of-day market snapshot and reaction-to-filing lookup."""
 from __future__ import annotations
 
-import statistics
 from datetime import date
+from typing import Any, Optional, Sequence
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
-from ..models import Price
-from .numbers import daily_return_pct, volume_ratio
+from . import numbers as N
 
 
-def series(s: Session, ticker: str, limit: int = 260) -> list[Price]:
-    rows = s.scalars(select(Price).where(Price.ticker == ticker).order_by(Price.date.desc()).limit(limit)).all()
-    return list(reversed(rows))
+def _get(r, k):
+    return r[k] if isinstance(r, dict) else getattr(r, k)
 
 
-def snapshot(rows: list[Price], window: int = 20) -> dict | None:
-    """Latest EOD stats with the trailing window *excluding* the latest session."""
-    if len(rows) < 2:
+def snapshot(rows: Sequence[Any]) -> Optional[dict]:
+    """rows: price rows sorted by date ascending (dicts or Price objects); snapshot as of the last row."""
+    rows = [r for r in rows if _get(r, "close") is not None]
+    if not rows:
         return None
-    last, prev = rows[-1], rows[-2]
-    hist = rows[-(window + 1) : -1]
-    rets = [daily_return_pct(b.close, a.close) for a, b in zip(rows[-(window + 2) : -2], rows[-(window + 1) : -1])]
-    rets = [r for r in rets if r is not None]
-    sd = statistics.pstdev(rets) if len(rets) > 3 else None
-    ret = daily_return_pct(last.close, prev.close)
-    first_y = next((r for r in rows if (last.date - r.date).days <= 365), rows[0])
+    last = rows[-1]
+    closes = [_get(r, "close") for r in rows]
+    vols = [_get(r, "volume") for r in rows]
+    ret = N.daily_return_pct(closes[-1], closes[-2]) if len(closes) >= 2 else None
+    trailing = vols[-21:-1]
+    vr = N.volume_ratio(vols[-1], trailing) if trailing else None
+    # sigma of today's move against the 20 sessions before it (today excluded, like the volume average)
+    rets = [N.daily_return_pct(closes[i], closes[i - 1]) for i in range(max(1, len(closes) - 21), len(closes) - 1)]
+    sd = N.stdev([r for r in rets if r is not None])
+    sigma = N.rnd(ret / sd, 2) if (ret is not None and sd) else None
+    year = rows[-252:] if len(rows) > 252 else rows
+    hi = max(_get(r, "high") or _get(r, "close") for r in year)
+    lo = min(_get(r, "low") or _get(r, "close") for r in year)
+    one_y = N.growth_pct(closes[-1], _get(year[0], "close")) if len(year) > 200 else None
+    avg_vol = N.mean([v for v in trailing if v is not None]) if trailing else None
     return {
-        "date": last.date.isoformat(),
-        "close": last.close,
-        "prev_close": prev.close,
-        "return_pct": ret,
-        "volume": last.volume,
-        "avg_volume": round(statistics.fmean([h.volume for h in hist if h.volume]), 0) if hist else None,
-        "volume_ratio": volume_ratio(last.volume, [h.volume for h in hist]),
-        "return_sigma": round(ret / sd, 2) if ret is not None and sd else None,
-        "vol_20d_pct": round(sd, 2) if sd else None,
-        "return_1y_pct": daily_return_pct(last.close, first_y.close),
-        "high_52w": max(r.high or r.close for r in rows[-252:]),
-        "low_52w": min(r.low or r.close for r in rows[-252:]),
-        "source": last.source,
+        "date": _get(last, "date").isoformat() if hasattr(_get(last, "date"), "isoformat") else _get(last, "date"),
+        "close": N.rnd(closes[-1], 2), "return_pct": ret, "volume": vols[-1],
+        "avg_volume": N.rnd(avg_vol, 0) if avg_vol else None, "volume_ratio": vr, "return_sigma": sigma,
+        "return_1y_pct": one_y, "high_52w": N.rnd(hi, 2), "low_52w": N.rnd(lo, 2),
+        "source": _get(last, "source"),
     }
 
 
-def reaction(rows: list[Price], on: date, window: int = 20) -> dict | None:
-    """Price/volume reaction on the first session on/after `on` (filings after 15:30 hit the next session)."""
-    idx = next((i for i, r in enumerate(rows) if r.date >= on), None)
-    if idx is None or idx < 2:
-        return None
-    sub = rows[: idx + 1]
-    snap = snapshot(sub, window)
-    return snap
+def reaction(rows: Sequence[Any], on_or_after: date) -> Optional[dict]:
+    """Snapshot as of the first session on or after `on_or_after`."""
+    for i, r in enumerate(rows):
+        if _get(r, "date") >= on_or_after:
+            return snapshot(rows[: i + 1])
+    return None

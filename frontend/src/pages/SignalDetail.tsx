@@ -1,215 +1,212 @@
-import { ArrowLeft, ExternalLink, HelpCircle, Linkedin, Microscope, Pin } from "lucide-react";
-import { useEffect } from "react";
-import { Bar, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { useAsk } from "../components/Ask";
-import { ErrorState, H2, ListSkeleton, MaterialityStrip, PriorityTag, SourceBadge, StatusPill } from "../components/ui";
-import { post, useApi } from "../lib/api";
-import { COMPONENTS, cr, crShort, pct, tone, when } from "../lib/format";
-import { back, go } from "../lib/router";
+import { ArrowLeft, ExternalLink, Pin, PinOff } from "lucide-react";
+import { Bar, CartesianGrid, ComposedChart, Legend, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { api } from "../lib/api";
+import { clock, cr, longDate, price, shortDate } from "../lib/format";
+import { href } from "../lib/router";
+import { DemoBadge, ErrorBox, LoadingRows, Pill, PriorityLabel, ResultsTable, Section, Strip, useAsk, useAsync } from "../components/ui";
+import { useEffect, useState } from "react";
 
-export default function SignalDetail({ id }: { id: string }) {
-  const { data: d, error, loading, reload } = useApi(`/api/signals/${id}`);
-  const { setTicker, ask } = useAsk();
-  useEffect(() => { if (d?.ticker) setTicker(d.ticker); }, [d?.ticker]);
-  if (error) return <ErrorState message={error} onRetry={reload} />;
-  if (loading || !d) return <ListSkeleton rows={6} />;
-  const e = d.enrichment ?? {};
-  const why = e.why ?? {};
+const tip = { contentStyle: { background: "#1B2940", border: "1px solid #26354F", borderRadius: 6, fontSize: 12 }, labelStyle: { color: "#8A9BB5" } };
 
+function WhyPanel({ why, demo }: { why: any; demo: boolean }) {
+  const rows: [string, string, React.ReactNode][] = [
+    ["What happened", "Confirmed from the filing", <ul className="space-y-1">{why.what_happened.map((w: string) => <li key={w}>{w}</li>)}</ul>],
+    ["What it could mean", "Inference, not a fact", why.implication],
+    ["Is this unusual?", "", <ul className="space-y-1">{why.is_it_unusual.map((w: string) => <li key={w}>{w}</li>)}<li>{why.financial_size}</li></ul>],
+    ["What history supports this", "", (
+      <span>{why.history.same_category_90d} similar filing{why.history.same_category_90d === 1 ? "" : "s"} from this company in 90 days
+        {why.history.last_same_category ? `, the last on ${shortDate(why.history.last_same_category)}` : ""}.</span>)],
+    ["What remains uncertain", "", (
+      <ul className="space-y-1">{why.uncertain.map((u: string) => <li key={u} className={demo && u.startsWith("ILLUSTRATIVE") ? "text-warn" : ""}>{u}</li>)}</ul>)],
+  ];
   return (
-    <article>
-      <button onClick={back} className="mb-4 inline-flex items-center gap-1 text-[13px] text-dim hover:text-fg"><ArrowLeft className="h-4 w-4" />Back</button>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-dim">
-        <button onClick={() => go("research", d.ticker)} className="text-[16px] font-bold text-fg hover:underline">{d.ticker}</button>
-        <span>{d.company}</span><span>{d.sector}</span>
-        {!d.in_portfolio && <span className="text-faint">Not in portfolio</span>}
-      </div>
-      <h1 className="w-semi mt-2 text-[22px] font-semibold leading-tight md:text-[26px]">{d.summary}</h1>
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-dim">
-        <PriorityTag p={d.priority} score={d.score} />
-        <span>{d.category_label}{d.category_method === "llm" ? " (LLM-classified)" : ""}</span>
-        <span>{when(d.published_at)}</span>
-        <SourceBadge source={d.source} />
-        <button onClick={() => post(`/api/signals/${d.id}/triage`, { action: d.triage === "pin" ? "clear" : "pin" }).then(reload)} className={`inline-flex items-center gap-1 ${d.triage === "pin" ? "text-up" : "hover:text-fg"}`}><Pin className="h-3.5 w-3.5" />{d.triage === "pin" ? "Pinned" : "Pin"}</button>
-      </div>
-      <p className="mt-3 text-[13.5px] text-dim">Filed as: {d.subject}</p>
-
-      {/* ---------------- Why should I care? */}
-      <section className="mt-6 rounded border border-line bg-surface p-4">
-        <h2 className="w-wide text-[17px] font-bold">Why should I care?</h2>
-        <WhyBlock title="What happened" tag="Confirmed from the filing">
-          <ul className="space-y-1">{(why.what_happened ?? []).map((x: string, i: number) => <li key={i} className="num">{x}</li>)}</ul>
-        </WhyBlock>
-        {why.implication && <WhyBlock title="What it could mean" tag="Inference, not a fact"><p>{why.implication}</p><p className="mt-1 text-dim">Size: {why.financial_size}</p></WhyBlock>}
-        <WhyBlock title="Is this unusual for the company?"><ul className="space-y-1">{(why.is_it_unusual ?? []).map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></WhyBlock>
-        <WhyBlock title="What history supports this"><ul className="space-y-1">{(why.history ?? []).map((x: string, i: number) => <li key={i} className="num">{x}</li>)}</ul></WhyBlock>
-        {why.uncertain?.length > 0 && <WhyBlock title="What remains uncertain"><ul className="space-y-1">{why.uncertain.map((x: string, i: number) => <li key={i} className={x.startsWith("ILLUSTRATIVE") ? "text-warn" : ""}>{x}</li>)}</ul></WhyBlock>}
-      </section>
-
-      {e.results && <ResultsCard card={e.results} />}
-      {e.management && <People m={e.management} />}
-
-      <H2>Questions worth asking</H2>
-      <ul className="space-y-1.5">
-        {(e.questions ?? []).map((q: string) => (
-          <li key={q}>
-            <button onClick={() => { setTicker(d.ticker); ask(q.replace(/\s*\(.*?\)\s*$/, ""), d.ticker); }} className="flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-[14px] hover:bg-surface">
-              <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-info" /><span>{q}</span>
-            </button>
-          </li>
-        ))}
-        <li><button onClick={() => go("research", d.ticker)} className="flex items-center gap-2 px-2 py-1.5 text-[14px] text-info hover:underline"><Microscope className="h-4 w-4" />Open {d.ticker} research</button></li>
-      </ul>
-
-      <H2>How FINN ranked this</H2>
-      <div className="rounded border border-line p-3">
-        <div className="mb-2 flex items-baseline justify-between"><span className="num w-cond text-[28px] font-semibold">{Math.round(d.score)}</span><span className="text-[12px] text-dim">of 100, weighted sum of five rules</span></div>
-        <MaterialityStrip breakdown={d.score_breakdown} score={d.score} height={10} showLegend />
-        <table className="num mt-3 w-full text-[13px]">
-          <thead><tr className="text-left text-[11.5px] text-dim"><th className="pb-1 font-normal">Component</th><th className="pb-1 text-right font-normal">Score</th><th className="pb-1 text-right font-normal">Weight</th><th className="pb-1 text-right font-normal">Adds</th></tr></thead>
-          <tbody>
-            {COMPONENTS.map((c) => {
-              const b = d.score_breakdown?.[c.key];
-              if (!b) return null;
-              return (
-                <tr key={c.key} className="border-t border-line align-top">
-                  <td className="py-1.5 pr-2"><span className="mr-1.5 inline-block h-2 w-2 rounded-sm" style={{ background: c.color }} />{c.label}<div className="text-[12px] text-dim">{b.reason}</div></td>
-                  <td className="py-1.5 text-right">{b.value}</td><td className="py-1.5 text-right text-dim">{b.weight}</td><td className="py-1.5 text-right font-semibold">{b.contribution}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {d.price_context?.length > 5 && <PriceContext rows={d.price_context} at={d.published_at} />}
-
-      <H2>Original filing</H2>
-      {d.attachment_url ? (
-        <a href={d.attachment_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-[14px] text-info hover:underline"><ExternalLink className="h-4 w-4" />Open on the exchange</a>
-      ) : (
-        <div className="text-[13px] text-dim">{d.source === "demo" ? "Illustrative filing text (no exchange link in demo mode):" : "No attachment link."}</div>
-      )}
-      {d.body && <pre className="scroll-thin mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-line bg-surface p-3 font-sans text-[12.5px] leading-relaxed text-dim">{d.body}</pre>}
-
-      {d.related?.length > 0 && (
-        <>
-          <H2>Earlier filings from {d.ticker}</H2>
-          <ul className="divide-y divide-line border-y border-line">
-            {d.related.map((r: any) => (
-              <li key={r.id}><button onClick={() => go("signal", r.id)} className="flex w-full items-baseline gap-3 py-2 text-left text-[13px]"><PriorityTag p={r.priority} /><span className="min-w-0 flex-1">{r.summary}</span><span className="shrink-0 text-[12px] text-faint">{when(r.published_at)}</span></button></li>
-            ))}
-          </ul>
-        </>
-      )}
-    </article>
-  );
-}
-
-function WhyBlock({ title, tag, children }: { title: string; tag?: string; children: React.ReactNode }) {
-  return (
-    <div className="mt-4 border-t border-line pt-3 text-[14px] leading-relaxed">
-      <div className="mb-1 flex flex-wrap items-baseline gap-2"><h3 className="font-semibold">{title}</h3>{tag && <span className="text-[11.5px] text-dim">{tag}</span>}</div>
-      {children}
-    </div>
-  );
-}
-
-export function ResultsCard({ card }: { card: any }) {
-  return (
-    <section className="mt-6">
-      <H2 right={card.verification && <StatusPill status={card.verification.status} />}>Results: {card.period}</H2>
-      <div className="text-[12px] text-dim">{card.basis ? `${card.basis[0].toUpperCase()}${card.basis.slice(1)}` : ""}, {card.unit}. Compared with {card.previous_period ?? "previous quarter"} and {card.year_ago_period ?? "same quarter last year"}.</div>
-      <div className="mt-2 overflow-x-auto">
-        <table className="num w-full text-[13.5px]">
-          <thead><tr className="text-left text-[11.5px] text-dim"><th className="py-1 font-normal" /> <th className="py-1 text-right font-normal">{card.period}</th><th className="py-1 text-right font-normal">QoQ</th><th className="py-1 text-right font-normal">YoY</th><th className="hidden py-1 text-right font-normal sm:table-cell">{card.year_ago_period}</th></tr></thead>
-          <tbody>
-            {card.rows.map((r: any) => (
-              <tr key={r.metric} className="border-t border-line">
-                <td className="py-2 font-semibold">{r.label}</td>
-                <td className="py-2 text-right">{r.current == null ? <span className="text-faint" title={r.note ?? ""}>N/A</span> : crShort(r.current)}</td>
-                <td className={`py-2 text-right ${tone(r.qoq_pct)}`}>{pct(r.qoq_pct)}</td>
-                <td className={`w-cond py-2 text-right text-[15px] font-semibold ${tone(r.yoy_pct)}`}>{pct(r.yoy_pct)}</td>
-                <td className="hidden py-2 text-right text-dim sm:table-cell">{crShort(r.year_ago)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {card.margins?.ebitda_margin != null && (
-        <div className="num mt-2 text-[13px] text-dim">EBITDA margin {card.margins.ebitda_margin}% vs {card.margins.ebitda_margin_yoy}% a year ago
-          {card.margins.ebitda_margin_change_bps_yoy != null && <span className={tone(card.margins.ebitda_margin_change_bps_yoy)}> ({card.margins.ebitda_margin_change_bps_yoy > 0 ? "+" : ""}{card.margins.ebitda_margin_change_bps_yoy} bps)</span>}</div>
-      )}
-      {card.rows.find((r: any) => r.note) && <div className="mt-1 text-[12px] text-faint">{card.rows.find((r: any) => r.note).note}</div>}
-      {card.verification && <div className="mt-1 text-[12px] text-dim">{card.verification.detail}</div>}
-      {card.flags?.map((f: string) => <div key={f} className="mt-1 text-[12.5px] text-warn">{f}</div>)}
-      {card.trend?.length > 2 && (
-        <div className="mt-3 h-44">
-          <ResponsiveContainer>
-            <ComposedChart data={card.trend} margin={{ top: 6, right: 4, left: -18, bottom: 0 }}>
-              <CartesianGrid stroke="#26354F" vertical={false} />
-              <XAxis dataKey="label" tick={{ fill: "#8A9BB5", fontSize: 10.5 }} tickFormatter={(v) => v.replace(" FY", " ’")} axisLine={false} tickLine={false} />
-              <YAxis yAxisId="l" tick={{ fill: "#8A9BB5", fontSize: 10.5 }} axisLine={false} tickLine={false} tickFormatter={(v) => crShort(v)} />
-              <YAxis yAxisId="r" orientation="right" hide domain={["auto", "auto"]} />
-              <Tooltip contentStyle={{ background: "#1B2940", border: "1px solid #26354F", borderRadius: 6, fontSize: 12 }} formatter={(v: any, n: any) => [n === "EBITDA margin" ? `${v}%` : cr(v), n]} />
-              <Bar yAxisId="l" dataKey="revenue" name="Revenue" fill="#5B9BF0" radius={[2, 2, 0, 0]} maxBarSize={22} />
-              <Bar yAxisId="l" dataKey="pat" name="PAT" fill="#3FB98A" radius={[2, 2, 0, 0]} maxBarSize={22} />
-              {card.trend.some((t: any) => t.ebitda_margin != null) && <Line yAxisId="r" dataKey="ebitda_margin" name="EBITDA margin" stroke="#E0A84B" strokeWidth={1.6} dot={{ r: 2 }} />}
-            </ComposedChart>
-          </ResponsiveContainer>
-          <div className="mt-1 flex gap-3 text-[11px] text-dim"><Key c="#5B9BF0" l="Revenue" /><Key c="#3FB98A" l="PAT" />{card.trend.some((t: any) => t.ebitda_margin != null) && <Key c="#E0A84B" l="EBITDA margin (right scale)" />}</div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-const Key = ({ c, l }: { c: string; l: string }) => <span className="inline-flex items-center gap-1"><span className="h-2 w-2 rounded-sm" style={{ background: c }} />{l}</span>;
-
-function People({ m }: { m: any }) {
-  return (
-    <section className="mt-6">
-      <H2>Who is involved</H2>
-      <div className="space-y-3">
-        {m.people.map((p: any, i: number) => (
-          <div key={i} className="rounded border border-line p-3">
-            <div className="flex flex-wrap items-baseline gap-x-2">
-              <span className="text-[15px] font-semibold">{p.name ?? "Name not stated"}</span>
-              <span className={`text-[12.5px] ${p.change === "appointment" ? "text-up" : "text-warn"}`}>{p.change}</span>
-              <span className="text-[12.5px] text-dim">{p.role}</span>
-            </div>
-            {(p.effective || p.reason) && <div className="mt-0.5 text-[12.5px] text-dim">{p.effective && `Effective ${p.effective}`}{p.effective && p.reason ? ", " : ""}{p.reason}</div>}
-            {p.profile ? <p className="mt-2 text-[13.5px] leading-relaxed">{p.profile}</p> : p.change === "appointment" && <p className="mt-2 text-[13px] text-faint">The filing gives no profile.</p>}
-            {p.linkedin_search && <a href={p.linkedin_search} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-[12.5px] text-info hover:underline"><Linkedin className="h-3.5 w-3.5" />Search LinkedIn</a>}
+    <section className="mt-6 rounded border border-line bg-surface p-4">
+      <h2 className="w-wide text-[18px] font-bold">Why should I care?</h2>
+      <dl className="hairline mt-2">
+        {rows.map(([t, note, body]) => (
+          <div key={t} className="py-2.5">
+            <dt className="text-[14px] font-semibold">{t} {note && <em className="ml-1 text-[12px] font-normal not-italic text-dim">({note})</em>}</dt>
+            <dd className="mt-1 text-[14px] leading-relaxed text-fg/85">{body}</dd>
           </div>
         ))}
-      </div>
-      <div className="mt-1 text-[11.5px] text-faint">Background is read from the profile the company must include in the filing (SEBI LODR), extracted by {m.method === "llm" ? "a small LLM" : "rules"}.</div>
+      </dl>
     </section>
   );
 }
 
-function PriceContext({ rows, at }: { rows: any[]; at: string }) {
-  const day = at.slice(0, 10);
-  const mark = rows.find((r) => r.date >= day)?.date;
+export default function SignalDetail({ id }: { id: number }) {
+  const { data: s, error, loading, reload, setData } = useAsync<any>(() => api.signal(id), [id]);
+  const ask = useAsk();
+  const [showText, setShowText] = useState(false);
+  useEffect(() => { if (s) ask.setTicker(s.ticker); /* eslint-disable-next-line */ }, [s?.ticker]);
+
+  if (loading && !s) return <LoadingRows n={5} />;
+  if (error) return <ErrorBox what="this signal" error={error} retry={reload} />;
+  if (!s) return null;
+  const enr = s.enrichment || {};
+  const card = enr.results;
+  const people = enr.people || [];
+  const demo = s.source === "demo";
+  const pinned = s.triage === "pin";
+  const togglePin = () => {
+    const a = pinned ? "clear" : "pin";
+    api.triage(s.id, a).then(() => setData({ ...s, triage: a === "clear" ? null : "pin" })).catch(() => {});
+  };
+  const px = s.price_context?.prices || [];
+
   return (
-    <section>
-      <H2>Price around the filing</H2>
-      <div className="h-36">
-        <ResponsiveContainer>
-          <ComposedChart data={rows} margin={{ top: 6, right: 4, left: -14, bottom: 0 }}>
-            <CartesianGrid stroke="#26354F" vertical={false} />
-            <XAxis dataKey="date" tick={{ fill: "#8A9BB5", fontSize: 10.5 }} tickFormatter={(v) => v.slice(5)} axisLine={false} tickLine={false} minTickGap={24} />
-            <YAxis yAxisId="p" domain={["auto", "auto"]} tick={{ fill: "#8A9BB5", fontSize: 10.5 }} axisLine={false} tickLine={false} width={52} />
-            <YAxis yAxisId="v" hide />
-            <Tooltip contentStyle={{ background: "#1B2940", border: "1px solid #26354F", borderRadius: 6, fontSize: 12 }} />
-            <Bar yAxisId="v" dataKey="volume" name="Volume" fill="#33446280" maxBarSize={8} />
-            <Line yAxisId="p" dataKey="close" name="Close" stroke="#E6ECF5" strokeWidth={1.5} dot={false} />
-            {mark && <ReferenceLine yAxisId="p" x={mark} stroke="#E0A84B" strokeDasharray="3 3" label={{ value: "filing", fill: "#E0A84B", fontSize: 10, position: "insideTopRight" }} />}
-          </ComposedChart>
-        </ResponsiveContainer>
+    <div>
+      <a href={href("brief")} className="inline-flex items-center gap-1 text-[14px] text-dim hover:text-fg"><ArrowLeft size={16} /> Brief</a>
+      <div className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <a href={href(`research/${s.ticker}`)} className="w-cond text-[20px] font-bold hover:text-info">{s.ticker}</a>
+        <span className="text-[14px] text-dim">{s.company}{s.sector ? `, ${s.sector}` : ""}</span>
+        {!s.in_portfolio && <span className="text-[12px] text-warn">Not in portfolio</span>}
       </div>
-      <div className="text-[11.5px] text-faint">End-of-day closes and volumes.</div>
-    </section>
+      <h1 className="w-semi mt-2 text-[22px] font-bold leading-snug md:text-[26px]">{s.summary}</h1>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[13px] text-dim">
+        <PriorityLabel p={s.priority} score={s.score} />
+        <span>{s.category_label}{s.category_method === "llm" ? " (LLM-classified)" : ""}</span>
+        <span>{longDate(s.published_at)}, {clock(s.published_at)} IST</span>
+        <DemoBadge show={demo} />
+        <button onClick={togglePin} aria-pressed={pinned} className={`ml-auto inline-flex items-center gap-1 rounded border px-2 py-1 ${pinned ? "border-info/50 text-info" : "border-line text-dim hover:text-fg"}`}>
+          {pinned ? <PinOff size={14} /> : <Pin size={14} />} {pinned ? "Pinned" : "Pin"}
+        </button>
+      </div>
+      <p className="mt-2 text-[13px] text-faint">Filed as: {s.subject}</p>
+
+      {enr.why && <WhyPanel why={enr.why} demo={demo} />}
+
+      {card && (
+        <Section title={`Results, ${card.period_label}`} aside={card.verification && <Pill status={card.verification.status} />}>
+          <p className="mb-2 text-[12px] text-dim">
+            {card.basis} basis, {card.unit}, compared with {card.previous_label || "the previous quarter"} and {card.year_ago_label || "a year ago"}.
+            {card.verification?.detail ? ` ${card.verification.detail}.` : ""}
+          </p>
+          <ResultsTable card={card} />
+          {card.trend?.length > 1 && (
+            <div className="mt-4 h-[210px]">
+              <ResponsiveContainer>
+                <ComposedChart data={card.trend} margin={{ top: 8, right: 4, left: -8, bottom: 0 }}>
+                  <CartesianGrid stroke="#26354F" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: "#8A9BB5", fontSize: 11 }} tickLine={false} axisLine={{ stroke: "#26354F" }} interval="preserveStartEnd" />
+                  <YAxis yAxisId="l" tick={{ fill: "#8A9BB5", fontSize: 11 }} tickLine={false} axisLine={false} width={52} tickFormatter={(v) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v)} />
+                  <YAxis yAxisId="r" orientation="right" hide domain={["auto", "auto"]} />
+                  <Tooltip {...tip} formatter={(v: any, n: any) => (n === "EBITDA margin" ? `${Number(v).toFixed(1)}%` : cr(v))} />
+                  <Legend wrapperStyle={{ fontSize: 12, color: "#8A9BB5" }} />
+                  <Bar yAxisId="l" dataKey="revenue" name="Revenue" fill="#5B9BF0" radius={[2, 2, 0, 0]} />
+                  <Bar yAxisId="l" dataKey="pat" name="PAT" fill="#3FB98A" radius={[2, 2, 0, 0]} />
+                  {!card.is_financial && <Line yAxisId="r" dataKey="ebitda_margin" name="EBITDA margin" stroke="#E0A84B" strokeWidth={2} dot={{ r: 2 }} />}
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Section>
+      )}
+
+      {people.length > 0 && (
+        <Section title="Who is involved">
+          <div className="grid gap-3 sm:grid-cols-2">
+            {people.map((p: any) => (
+              <div key={p.name} className="rounded border border-line bg-surface p-3.5">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-[16px] font-semibold">{p.name}</span>
+                  <span className={`text-[13px] ${p.change === "joins" ? "text-up" : "text-warn"}`}>{p.change === "joins" ? "Joins" : p.change === "leaves" ? "Leaves" : "Retires"}</span>
+                </div>
+                <div className="text-[14px] text-dim">{p.role}</div>
+                {(p.effective || p.reason) && <div className="mt-1 text-[13px] text-dim">{p.effective ? `Effective ${p.effective}` : ""}{p.effective && p.reason ? ". " : ""}{p.reason ? p.reason.charAt(0).toUpperCase() + p.reason.slice(1) : ""}</div>}
+                {p.profile && <p className="mt-2 text-[14px] leading-relaxed text-fg/85">{p.profile}</p>}
+                <a href={p.linkedin_search} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-[13px] text-info">Search LinkedIn <ExternalLink size={12} /></a>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[12px] text-faint">Background is read from the profile the company must include in the filing (SEBI LODR). LinkedIn is not scraped.</p>
+        </Section>
+      )}
+
+      {enr.questions?.length > 0 && (
+        <Section title="Questions worth asking">
+          <ul className="hairline border-y border-line">
+            {enr.questions.map((q: string) => (
+              <li key={q}><button onClick={() => ask.open(q.replace(/\s*\([^)]*\)\s*$/, ""), s.ticker)} className="w-full py-2.5 text-left text-[14px] hover:text-info">{q}</button></li>
+            ))}
+          </ul>
+          <a href={href(`research/${s.ticker}`)} className="mt-2 inline-block text-[14px] text-info">Open {s.ticker} research</a>
+        </Section>
+      )}
+
+      <Section title="How FINN ranked this">
+        <div className="flex items-end gap-4">
+          <div className="w-wide text-[40px] font-bold leading-none">{s.score.toFixed(0)}</div>
+          <div className="min-w-0 flex-1 pb-1"><Strip breakdown={s.breakdown} height={10} legend /></div>
+        </div>
+        <div className="mt-3">
+          <table className="w-full text-[13px]">
+            <thead><tr className="text-left text-[12px] text-dim">
+              <th className="py-1 font-normal">Component</th><th className="py-1 font-normal">Reason</th>
+              <th className="py-1 text-right font-normal">Score</th><th className="hidden py-1 text-right font-normal sm:table-cell">Weight</th>
+              <th className="py-1 text-right font-normal">Adds</th></tr></thead>
+            <tbody>
+              {s.breakdown.map((b: any) => (
+                <tr key={b.key} className="border-t border-line align-top">
+                  <td className="py-2 pr-2"><span className="inline-flex items-center gap-1.5 whitespace-nowrap"><span className="h-2 w-2 rounded-[2px]" style={{ background: `var(--c-${b.key}, ${({ category: "#5B9BF0", financial: "#3FB98A", deviation: "#E0A84B", relevance: "#A48BE8", novelty: "#4FC3C9" } as any)[b.key]})` }} />{b.label}</span></td>
+                  <td className="py-2 pr-2 text-dim">{b.reason}</td>
+                  <td className="w-cond py-2 text-right">{b.value.toFixed(0)}</td>
+                  <td className="w-cond hidden py-2 text-right text-dim sm:table-cell">{(b.weight * 100).toFixed(0)}%</td>
+                  <td className="w-cond py-2 text-right font-semibold">{b.contribution.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      {px.length > 1 && (
+        <Section title="Price around the filing">
+          <div className="h-[200px]">
+            <ResponsiveContainer>
+              <ComposedChart data={px} margin={{ top: 8, right: 4, left: -8, bottom: 0 }}>
+                <CartesianGrid stroke="#26354F" vertical={false} />
+                <XAxis dataKey="date" tickFormatter={(d) => shortDate(d)} tick={{ fill: "#8A9BB5", fontSize: 11 }} tickLine={false} axisLine={{ stroke: "#26354F" }} minTickGap={24} />
+                <YAxis yAxisId="p" domain={["auto", "auto"]} tick={{ fill: "#8A9BB5", fontSize: 11 }} tickLine={false} axisLine={false} width={52} />
+                <YAxis yAxisId="v" orientation="right" hide />
+                <Tooltip {...tip} labelFormatter={(d) => shortDate(String(d))} formatter={(v: any, n: any) => (n === "Close" ? price(v) : Number(v).toLocaleString("en-IN"))} />
+                <Bar yAxisId="v" dataKey="volume" name="Volume" fill="#26354F" />
+                <Line yAxisId="p" dataKey="close" name="Close" stroke="#5B9BF0" strokeWidth={2} dot={false} />
+                <ReferenceLine yAxisId="p" x={s.price_context.reaction_date} stroke="#E0A84B" strokeDasharray="4 3" label={{ value: "filing", fill: "#E0A84B", fontSize: 11, position: "insideTopRight" }} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </Section>
+      )}
+
+      <Section title="Original filing">
+        {s.attachment_url ? (
+          <a href={s.attachment_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[14px] text-info">Open on the exchange <ExternalLink size={13} /></a>
+        ) : (
+          <div>
+            <button onClick={() => setShowText(!showText)} className="text-[14px] text-info" aria-expanded={showText}>{showText ? "Hide" : "Show"} the {demo ? "demo " : ""}filing text</button>
+            {showText && (
+              <pre className="mt-2 max-h-[320px] overflow-auto whitespace-pre-wrap rounded border border-line bg-surface p-3 text-[12px] leading-relaxed text-dim">
+                {[s.body, s.attachment_text].filter(Boolean).join("\n\n").replace(/\f/g, "\n\n— page break —\n\n")}
+              </pre>
+            )}
+          </div>
+        )}
+      </Section>
+
+      {s.related?.length > 0 && (
+        <Section title={`Earlier filings from ${s.ticker}`}>
+          <ul className="hairline border-y border-line">
+            {s.related.map((r: any) => (
+              <li key={r.id}><a href={href(`signal/${r.id}`)} className="flex items-baseline gap-3 py-2 text-[14px] hover:text-info">
+                <span className="w-cond w-14 shrink-0 text-dim">{shortDate(r.published_at)}</span>
+                <span className="min-w-0 flex-1 truncate">{r.summary}</span>
+                <PriorityLabel p={r.priority} />
+              </a></li>
+            ))}
+          </ul>
+        </Section>
+      )}
+    </div>
   );
 }

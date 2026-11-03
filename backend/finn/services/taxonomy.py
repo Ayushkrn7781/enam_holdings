@@ -1,149 +1,152 @@
-"""Announcement taxonomy + rule-based classifier.
-
-Rules run first (free, instant, explainable). Only filings the rules leave as `unclassified`
-*and* whose exchange label is not obviously routine are sent to the cheap LLM tier.
-New categories are added by appending to CATEGORIES and RULES — nothing else changes.
-"""
+"""Announcement taxonomy: ordered regex rules, sub-type importance overrides, LLM fallback."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from typing import Optional
 
 from . import llm
 
-CATEGORIES: dict[str, dict] = {
-    "results": {"label": "Results", "importance": 90},
-    "M&A": {"label": "M&A", "importance": 85},
-    "management_change": {"label": "Management change", "importance": 75},
-    "fund_raise": {"label": "Fund raise", "importance": 70},
-    "litigation": {"label": "Litigation / regulatory", "importance": 70},
-    "pledging": {"label": "Promoter pledge", "importance": 70},
-    "credit_rating": {"label": "Credit rating", "importance": 55},
-    "capex": {"label": "Capex", "importance": 65},
-    "bonus_split": {"label": "Bonus / split", "importance": 55},
-    "insider_trading": {"label": "Insider trade", "importance": 50},
-    "press_release": {"label": "Press release", "importance": 40},
-    "dividend": {"label": "Dividend", "importance": 40},
-    "earnings_call": {"label": "Earnings call", "importance": 35},
-    "agm_egm": {"label": "AGM / EGM", "importance": 25},
-    "postal_ballot": {"label": "Postal ballot", "importance": 20},
-    "investor_meetings": {"label": "Investor meeting", "importance": 15},
-    "unclassified": {"label": "Routine", "importance": 5},
+IMPORTANCE = {
+    "results": 90, "M&A": 85, "management_change": 75, "fund_raise": 70, "litigation": 70,
+    "pledging": 70, "capex": 65, "credit_rating": 55, "bonus_split": 55, "insider_trading": 50,
+    "press_release": 40, "dividend": 40, "earnings_call": 35, "agm_egm": 25, "postal_ballot": 20,
+    "investor_meetings": 15, "unclassified": 5,
 }
 
-# (category, subtype, pattern). Order matters: first match wins.
-RULES: list[tuple[str, str, str]] = [
-    ("pledging", "pledge", r"\bpledg|encumbrance"),
-    ("insider_trading", "insider", r"insider trading|regulation 7\(2\)|sast|disclosure under sebi \(prohibition of insider|acquisition of shares by promoter|sale of shares by promoter"),
-    ("earnings_call", "transcript", r"transcript"),
-    ("earnings_call", "recording", r"audio recording|video recording|recording of (the )?(earnings|conference|analyst)"),
-    ("earnings_call", "notice", r"earnings call|conference call|con\. call|concall"),
-    ("investor_meetings", "meet", r"analyst|institutional investor|investor meet|investor conference|non-deal roadshow|one-on-one"),
-    ("results", "board_notice", r"board meeting.{0,80}(consider|approve).{0,60}(financial )?results|intimation of board meeting.{0,40}result"),
-    ("results", "results", r"financial results?|quarterly results?|unaudited.{0,30}results|audited.{0,30}results|results for the (quarter|year)|outcome of board meeting.{0,60}result|investor presentation|earnings (release|update)|shareholders'? letter"),
-    ("M&A", "deal", r"acqui(re|sition)|amalgamation|merger|demerger|scheme of arrangement|joint venture|\bjv\b|stake (sale|purchase)|divest|incorporation of (a )?(wholly owned )?subsidiary|investment in (wholly owned )?subsidiar"),
-    ("management_change", "kmp", r"chief executive|\bceo\b|chief financial|\bcfo\b|managing director|\bmd\b|whole[- ]time director|chief operating|\bcoo\b|change in (directors|key managerial|management)|resignation of|appointment of|cessation|re-?appointment|company secretary|compliance officer"),
-    ("fund_raise", "raise", r"\bqip\b|qualified institution|rights issue|preferential (issue|allotment)|buy-?back|non-convertible debenture|\bncds?\b|commercial paper|fund rais|raising of funds|issue of (equity|securities)"),
-    ("credit_rating", "rating", r"credit rating|\brating\b.{0,40}(crisil|icra|care|india ratings|brickwork|fitch|moody|s&p)|(crisil|icra|care ratings|india ratings)"),
-    ("litigation", "regulatory", r"usfda|form 483|warning letter|import alert|official action indicated|\boai\b"),
-    ("litigation", "legal", r"litigation|penalty|show cause|\bsebi order|tribunal|\bnclt\b|insolvency|court|arbitration|tax demand|\bgst\b.{0,30}(demand|order)|regulatory action|fine imposed|search and seizure|\braid\b"),
-    ("bonus_split", "corp_action", r"bonus|stock split|sub-?division|split of (equity )?shares"),
-    ("dividend", "dividend", r"dividend"),
-    ("capex", "capex", r"capex|capital expenditure|capacity expansion|new (plant|facility|factory|unit)|greenfield|brownfield|commissioning|commercial (production|operation)"),
-    ("postal_ballot", "ballot", r"postal ballot|e-?voting result|scrutini[sz]er"),
-    ("agm_egm", "meeting", r"annual general meeting|\bagm\b|extra-?ordinary general meeting|\begm\b|book closure"),
-    ("press_release", "order", r"order (win|received|inflow)|bags? (an )?order|letter of award|contract (award|win)|secures"),
-    ("press_release", "news", r"press release|launch|partnership|collaborat|clarification|media release|update on"),
-]
+LABELS = {
+    "results": "Results", "M&A": "M&A", "management_change": "Management change",
+    "fund_raise": "Fund raise", "litigation": "Litigation & regulatory", "pledging": "Promoter pledging",
+    "capex": "Capex", "credit_rating": "Credit rating", "bonus_split": "Bonus / split",
+    "insider_trading": "Insider trading", "press_release": "Press release", "dividend": "Dividend",
+    "earnings_call": "Earnings call", "agm_egm": "AGM / EGM", "postal_ballot": "Postal ballot",
+    "investor_meetings": "Investor meetings", "unclassified": "Routine",
+}
+
+SCHEDULED_SUBTYPES = {"board_notice", "routine", "meeting", "ballot", "meet", "recording", "notice"}
 
 ROUTINE = re.compile(
-    r"trading window|esop|esos|esps|allotment of (equity )?shares under|regulation 74\(5\)|compliance certificate|"
-    r"loss of share certificate|duplicate share|newspaper (publication|advertisement)|copy of newspaper|"
-    r"spurious|investor complaints|reconciliation of share capital|certificate under|brsr|business responsibility|"
-    r"sustainability report|esg|secretarial compliance|appointment of (statutory |secretarial |cost |internal )auditor|"
-    r"record date for interest|change in registrar|transfer of shares to iepf",
-    re.I,
-)
+    r"trading window|esop|esos|esps|allotment of shares under|regulation 74\s*\(5\)|compliance certificate|"
+    r"loss of share certificate|duplicate share|newspaper (publication|advertisement)|copy of newspaper|spurious|"
+    r"investor complaints|reconciliation of share capital|certificate under|brsr|business responsibility|"
+    r"sustainability report|\besg\b|secretarial compliance|appointment of (statutory|secretarial|cost|internal) auditor|"
+    r"record date for interest|change in registrar|iepf", re.I)
+
+_R = lambda p: re.compile(p, re.I)  # noqa: E731
+
+RULES: list[tuple[re.Pattern, str, str]] = [
+    (_R(r"pledg|encumbrance"), "pledging", "pledge"),
+    (_R(r"regulation 7\s*\(2\)|insider trading|\bsast\b|substantial acquisition of shares"), "insider_trading", "disclosure"),
+    (_R(r"transcript"), "earnings_call", "transcript"),
+    (_R(r"audio\s*/?\s*video recording|audio recording|video recording"), "earnings_call", "recording"),
+    (_R(r"earnings call|conference call|con\.\s*call|concall"), "earnings_call", "notice"),
+    (_R(r"analyst|institutional investor|investor meet|investor conference|non-deal roadshow|one-on-one"),
+     "investor_meetings", "meet"),
+    (_R(r"board meeting.{0,80}(consider|approve).{0,60}results|intimation of board meeting.{0,40}result"),
+     "results", "board_notice"),
+    (_R(r"financial results?|quarterly results?|unaudited.{0,40}results|audited.{0,40}results|"
+        r"results for the (quarter|year)|outcome of board meeting.{0,60}result|investor presentation|"
+        r"earnings (release|update)|shareholders'? letter"), "results", "results"),
+    (_R(r"acqui(re|sition)|amalgamation|merger|demerger|scheme of arrangement|joint venture|"
+        r"stake (sale|purchase)|divest|incorporation of.{0,40}subsidiary|investment in.{0,40}subsidiar"), "M&A", "deal"),
+    (_R(r"\bceo\b|\bcfo\b|managing director|whole[- ]time director|\bcoo\b|change in (directors|key managerial|management)|"
+        r"resignation of|appointment of|cessation|re-appointment|company secretary|compliance officer"),
+     "management_change", "change"),
+    (_R(r"\bqip\b|qualified institution|rights issue|preferential|buy-?back|\bncds?\b|non-convertible debenture|"
+        r"commercial paper|fund rais|raising of funds|issue of (equity|securities)|basel iii|bonds?\b"), "fund_raise", "raise"),
+    (_R(r"credit rating|\bcrisil\b|\bicra\b|care ratings|india ratings|rating agency"), "credit_rating", "rating"),
+    (_R(r"usfda|form 483|warning letter|import alert|official action indicated"), "litigation", "regulatory"),
+    (_R(r"litigation|penalty|show cause|sebi order|tribunal|\bnclt\b|insolvency|\bcourt\b|arbitration|tax demand|"
+        r"gst.{0,40}(demand|order)|regulatory action|search and seizure"), "litigation", "legal"),
+    (_R(r"\bbonus\b|stock split|sub-division"), "bonus_split", "corporate_action"),
+    (_R(r"dividend"), "dividend", "dividend"),
+    (_R(r"\bcapex\b|capital expenditure|capacity expansion|new (plant|facility|factory|unit)|greenfield|brownfield|"
+        r"commissioning|commercial (production|operation)"), "capex", "capex"),
+    (_R(r"postal ballot|e-voting result|scrutini[sz]er"), "postal_ballot", "ballot"),
+    (_R(r"\bagm\b|\begm\b|annual general meeting|book closure"), "agm_egm", "meeting"),
+    (_R(r"order (win|received|inflow)|bags.{0,40}order|letter of award|contract (award|win)|secures"),
+     "press_release", "order"),
+    (_R(r"press release|launch|partnership|collaborat|clarification|media release|update on"), "press_release", "news"),
+]
 
 
-@dataclass
-class Classification:
-    category: str
-    subtype: str
-    method: str  # rules | llm | routine
-
-
-def classify(subject: str, exchange_category: str | None = None, body: str | None = None) -> Classification:
-    text = " ".join(filter(None, [exchange_category, subject, (body or "")[:600]])).lower()
-    head = " ".join(filter(None, [exchange_category, subject])).lower()
-    if ROUTINE.search(head):
-        return Classification("unclassified", "routine", "routine")
-    # Subject first (most precise), then the exchange's own label, then the body text.
-    for blob in (subject.lower(), (exchange_category or "").lower(), text):
-        for cat, sub, pat in RULES:
-            if blob and re.search(pat, blob, re.I):
-                return Classification(cat, sub, "rules")
-    return _llm_classify(subject, body) or Classification("unclassified", "other", "rules")
-
-
-def _llm_classify(subject: str, body: str | None) -> Classification | None:
-    if not llm.available():
-        return None
-    cats = ", ".join(CATEGORIES)
-    out = llm.complete_json(
-        [
-            {
-                "role": "system",
-                "content": "You classify Indian stock-exchange corporate announcements. "
-                f"Allowed categories: {cats}. Reply JSON: {{\"category\": ...}}. Use 'unclassified' for routine compliance paperwork.",
-            },
-            {"role": "user", "content": f"Subject: {subject}\n\nText: {(body or '')[:1200]}"},
-        ],
-        tier="fast",
-        max_tokens=40,
-    )
-    if out and out.get("category") in CATEGORIES:
-        return Classification(out["category"], "llm", "llm")
+def _match(text: str) -> Optional[tuple[str, str]]:
+    for rx, cat, sub in RULES:
+        if rx.search(text):
+            return cat, sub
     return None
 
 
-def subtype_importance(category: str, subtype: str, text: str) -> tuple[int, str]:
-    """Category importance with explainable sub-type adjustments. Returns (score, reason)."""
-    base = CATEGORIES.get(category, CATEGORIES["unclassified"])["importance"]
-    t = text.lower()
+def classify_rules(subject: str, exchange_category: str | None = None, body: str | None = None
+                   ) -> Optional[tuple[str, str]]:
+    subj = subject or ""
+    if ROUTINE.search(subj) or ROUTINE.search(exchange_category or ""):
+        return "unclassified", "routine"
+    for text in (subj, exchange_category or "", (body or "")[:600]):
+        if text and (hit := _match(text)):
+            return hit
+    return None
+
+
+def classify(subject: str, exchange_category: str | None = None, body: str | None = None
+             ) -> tuple[str, str, str]:
+    """Returns (category, subtype, method)."""
+    hit = classify_rules(subject, exchange_category, body)
+    if hit:
+        return hit[0], hit[1], "rules"
+    if llm.available():
+        cats = ", ".join(k for k in IMPORTANCE)
+        out = llm.complete_json([
+            {"role": "system", "content": "You classify Indian stock-exchange filings. Reply JSON only."},
+            {"role": "user", "content": f"Categories: {cats}.\nFiling subject: {subject}\nExchange label: "
+                                        f"{exchange_category}\nBody: {(body or '')[:800]}\n"
+                                        'Return {"category": "<one category>"}'},
+        ], tier="fast", max_tokens=60)
+        cat = (out or {}).get("category") if isinstance(out, dict) else None
+        if cat in IMPORTANCE:
+            return cat, "llm", "llm"
+    return "unclassified", "unknown", "rules"
+
+
+def importance(category: str, subtype: str, text: str) -> tuple[float, str]:
+    """Base importance with sub-type overrides; returns (score, reason)."""
+    t = (text or "").lower()
+    base = IMPORTANCE.get(category, 5)
+    label = LABELS.get(category, category)
     if category == "results" and subtype == "board_notice":
-        return 30, "board-meeting notice for results (date only, no numbers)"
+        return 30, "Board-meeting notice for results (scheduled, no numbers yet)"
     if category == "management_change":
-        if re.search(r"chief executive|\bceo\b|managing director|\bmd\b|chief financial|\bcfo\b", t):
-            return 92, "CEO/MD/CFO-level change"
+        if re.search(r"\b(ceo|cfo|managing director|chief executive|chief financial)\b", t):
+            return 92, "Change in CEO / MD / CFO, a top-level role"
         if re.search(r"company secretary|compliance officer", t):
-            return 30, "company secretary / compliance officer change"
-        if re.search(r"independent director", t):
-            return 45, "independent director change"
+            return 30, "Company secretary / compliance officer change"
+        if "independent director" in t:
+            return 45, "Independent director change"
     if category == "credit_rating":
-        if "downgrad" in t or "negative" in t:
-            return 85, "rating downgrade / negative outlook"
-        if "upgrad" in t or "positive" in t:
-            return 65, "rating upgrade / positive outlook"
+        if re.search(r"downgrad|negative outlook|credit watch with negative", t):
+            return 85, "Credit rating downgrade or negative outlook"
+        if re.search(r"upgrad|positive outlook", t):
+            return 65, "Credit rating upgrade or positive outlook"
         if "reaffirm" in t:
-            return 20, "rating reaffirmed (no change)"
+            return 20, "Credit rating reaffirmed, no change"
     if category == "fund_raise":
         if "commercial paper" in t:
-            return 30, "routine commercial-paper issuance"
-        if "buyback" in t or "buy-back" in t or "buy back" in t:
-            return 78, "buyback (capital return)"
-    if category == "pledging" and re.search(r"release|revocation", t):
-        return 40, "pledge released"
+            return 30, "Commercial paper, routine short-term borrowing"
+        if re.search(r"buy-?back", t):
+            return 78, "Share buyback"
+    if category == "pledging" and re.search(r"releas|revoc", t):
+        return 40, "Pledge released"
     if category == "litigation" and subtype == "regulatory":
-        if re.search(r"warning letter|import alert|official action indicated", t):
-            return 85, "USFDA warning letter / import alert"
-        return 60, "regulatory inspection observations"
+        if re.search(r"warning letter|import alert|official action indicated|\boai\b", t):
+            return 85, "USFDA warning letter / import alert / OAI"
+        return 60, "USFDA inspection observations"
     if category == "earnings_call" and subtype == "transcript":
-        return 45, "transcript available (primary source for guidance)"
+        return 45, "Earnings-call transcript published"
     if category == "press_release" and subtype == "order":
-        return 60, "order win"
-    return base, f"{CATEGORIES.get(category, {}).get('label', category)} base weight"
+        return 60, "Order win"
+    if category == "unclassified":
+        return 5, "Routine compliance filing"
+    return base, f"{label} filings carry base importance {base}"
 
 
-# Scheduled or recurring paperwork: by definition not "news", so novelty is capped.
-SCHEDULED_SUBTYPES = {"board_notice", "routine", "meeting", "ballot", "meet", "recording", "notice"}
+def categories() -> list[dict]:
+    return [{"key": k, "label": LABELS[k], "importance": v} for k, v in IMPORTANCE.items()]

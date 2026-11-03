@@ -1,151 +1,203 @@
-"""Thin LLM gateway with model routing, response caching and graceful degradation.
+"""LLM gateway: Google Gemini (free tier) through its OpenAI-compatible endpoint.
 
-Routing policy (cost discipline):
-  fast   -> cheap 8B model: classification fallback, one-line summaries, bio / guidance extraction
-  strong -> 70B model: research synthesis, promise-vs-delivered interpretation only
-
-Every call is cached by sha256(model + messages), so re-running a refresh or re-asking a question
-costs nothing. If no API key is configured, `available()` is False and every caller has a deterministic
-fallback path — the app never depends on a paid or keyed service to run.
+Rules first; Flash-Lite ("fast") for bulk extraction; Flash ("strong") only for synthesis.
+The response cache lives in its own SQLite file so an LLM call made inside an open write
+transaction on the main DB can never deadlock on it.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
+import sqlite3
+import threading
 import time
-from typing import Any, Literal
+from typing import Any, Optional
 
 import httpx
 
-import sqlite3
-import threading
+from ..config import settings
 
-from ..config import DATA_DIR, settings
+FALLBACK_FAST = "gemini-3.5-flash-lite"
+FALLBACK_STRONG = "gemini-3.8-flash"
+_EXCLUDE = re.compile(r"image|tts|audio|live|embed|vision|thinking|exp|preview|learnlm", re.I)
 
-log = logging.getLogger("finn.llm")
-Tier = Literal["fast", "strong"]
-
-_stats = {"calls": 0, "cache_hits": 0, "prompt_tokens": 0, "completion_tokens": 0, "errors": 0}
-
-
-# The response cache lives in its own SQLite file so a cache write can never contend with
-# (or deadlock against) an in-flight transaction in the main database.
-_CACHE_PATH = DATA_DIR / "llm_cache.db"
+_lock = threading.Lock()
 _cache_lock = threading.Lock()
-
-
-def _cache_conn() -> sqlite3.Connection:
-    c = sqlite3.connect(_CACHE_PATH, timeout=5)
-    c.execute("CREATE TABLE IF NOT EXISTS llm_cache (key TEXT PRIMARY KEY, model TEXT, response TEXT, prompt_tokens INT, completion_tokens INT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-    return c
-
-
-def _cache_get(key: str) -> str | None:
-    try:
-        with _cache_lock, _cache_conn() as c:
-            row = c.execute("SELECT response FROM llm_cache WHERE key=?", (key,)).fetchone()
-            return row[0] if row else None
-    except sqlite3.Error as e:
-        log.warning("llm cache read failed: %s", e)
-        return None
-
-
-def _cache_put(key: str, model: str, text: str, usage: dict) -> None:
-    try:
-        with _cache_lock, _cache_conn() as c:
-            c.execute("INSERT OR REPLACE INTO llm_cache (key, model, response, prompt_tokens, completion_tokens) VALUES (?,?,?,?,?)",
-                      (key, model, text, usage.get("prompt_tokens"), usage.get("completion_tokens")))
-    except sqlite3.Error as e:  # a cache miss next time is fine; failing the call is not
-        log.warning("llm cache write failed: %s", e)
+_last_call = 0.0
+_models: dict[str, str] | None = None
+_json_mode_ok = True  # flipped off once the endpoint rejects response_format, so we stop paying for the retry
+_stats = {"calls": 0, "cache_hits": 0, "prompt_tokens": 0, "completion_tokens": 0, "errors": 0}
 
 
 def available() -> bool:
     return bool(settings.llm_api_key)
 
 
-def stats() -> dict[str, Any]:
-    return {
-        **_stats,
-        "provider": settings.llm_base_url if available() else None,
-        "fast_model": settings.llm_fast_model,
-        "strong_model": settings.llm_strong_model,
-        "configured": available(),
-    }
+def reset_state() -> None:
+    global _models, _last_call, _json_mode_ok
+    _models = None
+    _json_mode_ok = True
+    _last_call = 0.0
+    for k in _stats:
+        _stats[k] = 0
 
 
-def _model(tier: Tier) -> str:
-    return settings.llm_fast_model if tier == "fast" else settings.llm_strong_model
+def _version_key(model_id: str) -> tuple:
+    head = model_id.split("flash")[0]
+    return tuple(int(x) for x in re.findall(r"\d+", head))
 
 
-def complete(
-    messages: list[dict[str, str]],
-    tier: Tier = "fast",
-    *,
-    json_mode: bool = False,
-    max_tokens: int = 700,
-    temperature: float = 0.0,
-) -> str | None:
-    """Return model text, or None if the LLM is unavailable/failed (caller must fall back)."""
+def resolve_models() -> dict[str, str]:
+    """Resolve fast/strong once per process. Env overrides win; else list models; else fallbacks."""
+    global _models
+    if _models is not None:
+        return _models
+    fast, strong = settings.llm_fast_model, settings.llm_strong_model
+    if (not fast or not strong) and available():
+        try:
+            r = httpx.get(f"{settings.llm_base_url}/models", timeout=15,
+                          headers={"Authorization": f"Bearer {settings.llm_api_key}"})
+            r.raise_for_status()
+            ids = [str(m.get("id", "")).removeprefix("models/") for m in r.json().get("data", [])]
+            ids = [i for i in ids if i.startswith("gemini-") and not _EXCLUDE.search(i)]
+            lites = sorted([i for i in ids if i.endswith("flash-lite")], key=_version_key)
+            flashes = sorted([i for i in ids if i.endswith("-flash")], key=_version_key)
+            fast = fast or (lites[-1] if lites else None)
+            strong = strong or (flashes[-1] if flashes else None)
+        except Exception:
+            pass
+    _models = {"fast": fast or FALLBACK_FAST, "strong": strong or FALLBACK_STRONG}
+    return _models
+
+
+# ---------------------------------------------------------------- cache
+def _cache_conn() -> sqlite3.Connection:
+    c = sqlite3.connect(str(settings.llm_cache_path), timeout=5)
+    c.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, v TEXT, at REAL)")
+    return c
+
+
+def _cache_get(key: str) -> Optional[str]:
+    try:
+        with _cache_lock:
+            c = _cache_conn()
+            try:
+                row = c.execute("SELECT v FROM cache WHERE k=?", (key,)).fetchone()
+            finally:
+                c.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _cache_put(key: str, value: str) -> None:
+    try:
+        with _cache_lock:
+            c = _cache_conn()
+            try:
+                c.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, value, time.time()))
+                c.commit()
+            finally:
+                c.close()
+    except Exception:
+        pass
+
+
+def _throttle() -> None:
+    global _last_call
+    with _lock:
+        wait = settings.llm_min_interval_s - (time.monotonic() - _last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call = time.monotonic()
+
+
+def complete(messages: list[dict[str, str]], tier: str = "fast", json_mode: bool = False,
+             max_tokens: int = 800, temperature: float = 0.0) -> Optional[str]:
     if not available():
         return None
-    model = _model(tier)
+    model = resolve_models()[tier]
     key = hashlib.sha256(json.dumps([model, messages, json_mode], sort_keys=True).encode()).hexdigest()
     hit = _cache_get(key)
     if hit is not None:
         _stats["cache_hits"] += 1
         return hit
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    for attempt in range(3):
+    global _json_mode_ok
+    use_json = json_mode and _json_mode_ok
+    for attempt in range(4):
+        body: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens,
+                                "temperature": temperature}
+        if use_json:
+            body["response_format"] = {"type": "json_object"}
+        _throttle()
         try:
-            r = httpx.post(
-                f"{settings.llm_base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json=payload,
-                timeout=settings.llm_timeout_s,
-            )
-            if r.status_code == 429:  # free-tier rate limit: back off and retry
-                time.sleep(2 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            text = data["choices"][0]["message"]["content"]
-        except Exception as e:  # network, 5xx, malformed
-            log.warning("LLM call failed (%s, attempt %d): %s", model, attempt + 1, e)
-            time.sleep(1)
+            r = httpx.post(f"{settings.llm_base_url}/chat/completions", json=body,
+                           timeout=settings.llm_timeout_s,
+                           headers={"Authorization": f"Bearer {settings.llm_api_key}"})
+        except httpx.HTTPError:
+            _stats["errors"] += 1
             continue
-        usage = data.get("usage", {})
+        if r.status_code == 429:
+            _stats["errors"] += 1
+            try:
+                wait = float(r.headers.get("retry-after", ""))
+            except ValueError:
+                wait = 8 * (attempt + 1)
+            time.sleep(min(60.0, wait))
+            continue
+        if r.status_code == 400 and use_json:
+            use_json = _json_mode_ok = False
+            continue
+        if r.status_code >= 400:
+            _stats["errors"] += 1
+            continue
+        try:
+            data = r.json()
+            text = data["choices"][0]["message"]["content"] or ""
+            usage = data.get("usage") or {}
+        except Exception:
+            _stats["errors"] += 1
+            continue
         _stats["calls"] += 1
-        _stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
-        _stats["completion_tokens"] += usage.get("completion_tokens", 0)
-        _cache_put(key, model, text, usage)
+        _stats["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+        _stats["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+        _cache_put(key, text)
         return text
-    _stats["errors"] += 1
     return None
 
 
-def complete_json(messages: list[dict[str, str]], tier: Tier = "fast", **kw) -> Any | None:
-    text = complete(messages, tier, json_mode=True, **kw)
-    if text is None:
+def parse_json(text: Optional[str]) -> Any:
+    if not text:
         return None
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}|\[.*\]", text, re.S)
+        return json.loads(t)
+    except Exception:
+        pass
+    for pat in (r"\{.*\}", r"\[.*\]"):
+        m = re.search(pat, t, re.S)
         if m:
             try:
                 return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                pass
-    log.warning("LLM returned non-JSON output")
+            except Exception:
+                continue
     return None
+
+
+def complete_json(messages: list[dict[str, str]], tier: str = "fast", max_tokens: int = 1200) -> Any:
+    return parse_json(complete(messages, tier=tier, json_mode=True, max_tokens=max_tokens))
+
+
+def stats() -> dict[str, Any]:
+    out: dict[str, Any] = dict(_stats)
+    out["tokens"] = out["prompt_tokens"] + out["completion_tokens"]
+    out["provider"] = "Google Gemini"
+    out["configured"] = available()
+    out["models"] = resolve_models() if available() else None
+    out["routing"] = {
+        "fast": "classification fallback, summaries, bios, results-page fallback, guidance extraction",
+        "strong": "narrative synthesis, guidance interpretation, bull vs bear",
+    }
+    return out

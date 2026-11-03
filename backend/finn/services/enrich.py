@@ -1,137 +1,132 @@
-"""Per-category enrichment for pushed items.
+"""Filing enrichment: who is involved in a management change, and ₹ amounts.
 
-management_change: SEBI LODR (Reg. 30, Schedule III) requires a "brief profile" of any appointed director/KMP
-in the filing itself, so FINN reads the bio straight from the primary document — no LinkedIn scraping
-(which violates LinkedIn's terms). A LinkedIn *search link* is attached for the investor to click.
+SEBI LODR requires the filing itself to carry a brief profile of an appointee, so the bio is read
+from the filing. LinkedIn is not scraped (its terms forbid it); a people-search link is attached.
 """
 from __future__ import annotations
 
 import re
-import urllib.parse
+from typing import Optional
+from urllib.parse import quote_plus
 
 from . import llm
 
-_AMOUNT = re.compile(
-    r"(?:rs\.?|₹|inr)\s*([\d,]+(?:\.\d+)?)\s*(crores?|cr\.?|lakhs?|lacs?|million|mn|billion|bn)\b"
-    r"|([\d,]+(?:\.\d+)?)\s*(crores?|cr\b)",
-    re.I,
-)
+_HON = r"(?:Mr|Ms|Mrs|Dr|Shri|Smt)\.?"
+_NAME = re.compile(rf"\b{_HON}\s+((?:[A-Z][a-zA-Z'\-]+\.?\s?){{1,4}})")
+_ROLE = re.compile(r"(Chief Financial Officer|Chief Executive Officer|Chief Operating Officer|Managing Director(?: and CEO)?|"
+                   r"Whole[- ]time Director|Independent Director|Non-Executive Director|Company Secretary|"
+                   r"Compliance Officer|Chairman|\bCFO\b|\bCEO\b|\bCOO\b|\bMD\b|Key Managerial Personnel|KMP)", re.I)
+_EFF = re.compile(r"(?:w\.e\.f\.?|with effect from|effective(?: from)?)\s*(?:the\s+)?(?:close of business hours on\s+)?"
+                  r"([0-9]{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+,?\s+[0-9]{4}|[A-Z][a-z]+\s+[0-9]{1,2},?\s+[0-9]{4}|"
+                  r"[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})", re.I)
+_REASON = re.compile(r"(to pursue [^.;,]+)", re.I)
+_PROFILE = re.compile(rf"Brief profile of\s+{_HON}?\s*([A-Z][\w .'\-]+?)\s*:\s*(.+?)(?:\n\s*\n|$)", re.S)
+
+ROLE_CANON = {"cfo": "Chief Financial Officer", "ceo": "Chief Executive Officer", "coo": "Chief Operating Officer",
+              "md": "Managing Director", "kmp": "Key Managerial Personnel"}
 
 
-def extract_amount_cr(text: str) -> float | None:
-    """Largest INR amount mentioned, in crore. Used for financial-impact scoring."""
-    best = None
-    for m in _AMOUNT.finditer(text or ""):
-        num, unit = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
-        try:
-            v = float(num.replace(",", ""))
-        except ValueError:
-            continue
-        u = unit.lower()
-        if u.startswith("lak") or u.startswith("lac"):
-            v /= 100
-        elif u in ("million", "mn"):
-            v /= 10
-        elif u in ("billion", "bn"):
-            v *= 100
-        best = v if best is None else max(best, v)
-    return best
+def linkedin_search(name: str, company: str | None = None) -> str:
+    q = f"{name} {company or ''}".strip()
+    return f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(q)}"
 
 
-_ROLE = r"(Chief Executive Officer|Chief Financial Officer|Managing Director(?: (?:&|and) CEO)?|Whole[- ]Time Director|Chief Operating Officer|Company Secretary|Independent Director|Non-Executive Director|Executive Director|Director|CEO|CFO|COO)"
+def _canon_role(r: str) -> str:
+    return ROLE_CANON.get(r.lower(), r.title() if r.isupper() is False else r)
 
 
-def management_change(subject: str, text: str) -> dict:
-    """Return {people:[{name, role, change, effective, profile, linkedin_search}], method}."""
-    if llm.available() and text:
-        out = llm.complete_json(
-            [
-                {
-                    "role": "system",
-                    "content": "Extract management changes from an Indian corporate filing. Use only facts in the text. "
-                    'Reply JSON {"people":[{"name":str,"role":str,"change":"appointment|resignation|retirement|re-appointment|cessation",'
-                    '"effective":str|null,"reason":str|null,"profile":str|null}]}. profile = the brief profile/background given in the filing, '
-                    "condensed to <=45 words (prior employers, roles, education, years of experience). null if the filing has none.",
-                },
-                {"role": "user", "content": f"Subject: {subject}\n\n{text[:7000]}"},
-            ],
-            tier="fast",
-            max_tokens=600,
-        )
-        if out and out.get("people"):
-            for p in out["people"]:
-                p["linkedin_search"] = _li(p.get("name"))
-            return {"people": out["people"], "method": "llm", "source": "filing text"}
-    return _rules_management(subject, text)
+def _clip_words(text: str, n: int) -> str:
+    w = text.split()
+    return " ".join(w[:n]) + ("…" if len(w) > n else "")
 
 
-def _li(name: str | None) -> str | None:
-    if not name:
-        return None
-    return "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(name)
-
-
-_HON = r"(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?|Shri|Smt\.?)\s+"
-_NAME = r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z.]+){0,3})"
-
-
-def _rules_management(subject: str, text: str) -> dict:
-    """Deterministic fallback: one entry per person, with the change attributed from the verb near their name."""
-    blob = f"{subject}\n{text or ''}"
+def management_change_rules(text: str) -> list[dict]:
+    text = text or ""
+    profiles = {}
+    for m in _PROFILE.finditer(text):
+        profiles[m.group(1).strip().rstrip(".")] = " ".join(m.group(2).split())
     people: dict[str, dict] = {}
-    for m in re.finditer(_HON + _NAME, blob):
-        name = m.group(1).strip().rstrip(".")
-        if name in people:
+    for m in _NAME.finditer(text):
+        name = " ".join(m.group(1).split()).rstrip(".")
+        # drop trailing lowercase words captured by mistake
+        name = " ".join(t for t in name.split() if t[0].isupper())
+        if not name or name in people:
             continue
-        ctx = blob[max(0, m.start() - 120): m.end() + 220]
-        after = blob[m.end(): m.end() + 220]
-        if re.search(r"resign|tendered|step(ping)? down|cessation|ceased", after, re.I):
-            change = "resignation"
-        elif re.search(r"retire|superannuat", after, re.I):
-            change = "retirement"
-        elif re.search(r"appoint", ctx, re.I):
-            change = "appointment"
-        else:
-            continue  # a name with no change attached (e.g. a signatory)
-        role_m = re.search(_ROLE, after, re.I) or re.search(_ROLE, ctx, re.I)
-        eff = re.search(r"(?:w\.?e\.?f\.?|with effect from|effective(?: from)?)\s*(?:close of business hours on\s*)?([0-9]{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+[0-9]{4}|[0-9]{1,2}[\-/.][0-9]{1,2}[\-/.][0-9]{2,4})", after, re.I)
-        people[name] = {"name": name, "role": role_m.group(1) if role_m else None, "change": change,
-                        "effective": eff.group(1).strip() if eff else None, "reason": None, "profile": None, "linkedin_search": _li(name)}
-        rm = re.search(r"to pursue ([^.,]{5,80})", after, re.I)
-        if change == "resignation" and rm:
-            people[name]["reason"] = "to pursue " + rm.group(1).strip()
-    for pm in re.finditer(r"brief profile(?: of)?\s*(?:" + _HON + r")?([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z.]+){0,3})?\s*[:\n-]\s*(.{40,900}?)(?:\n\s*\n|disclosure of relationship|$)", blob, re.I | re.S):
-        who = (pm.group(1) or "").strip().rstrip(".")
-        words = re.sub(r"\s+", " ", pm.group(2)).split()
-        prof = " ".join(words[:48]) + ("…" if len(words) > 48 else "")
-        target = people.get(who) or next((p for p in people.values() if p["change"] == "appointment"), None)
-        if target:
-            target["profile"] = prof
+        after = text[m.end(): m.end() + 260]
+        sent_end = re.search(r"(?<!\bw\.e\.f)\.\s+(?=[A-Z])", after)
+        ctx = after[: sent_end.start() + 1] if sent_end else after
+        # same-sentence lead-in, e.g. "approved the appointment of Ms. X"
+        before = text[max(0, m.start() - 100): m.start()]
+        before = re.split(r"(?<!\bw\.e\.f)\.\s+(?=[A-Z])|\n", before)[-1]
+        change = None
+        if re.search(r"resign|tender(ed)? (his|her) resignation|cessation|ceases?|stepp(ed|ing) down", ctx, re.I):
+            change = "leaves"
+        elif re.search(r"retir", ctx, re.I):
+            change = "retires"
+        elif re.search(r"appoint|joins|designated|elevated|re-appoint", before + " " + ctx, re.I):
+            change = "joins"
+        if not change:
+            continue
+        role_m = _ROLE.search(ctx)
+        eff = _EFF.search(ctx)
+        reason = _REASON.search(ctx)
+        people[name] = {"name": name, "role": _canon_role(role_m.group(1)) if role_m else None, "change": change,
+                        "effective": eff.group(1) if eff else None,
+                        "reason": reason.group(1).strip() if reason else None, "profile": None, "method": "rules"}
+    for pname, prof in profiles.items():
+        target = next((p for n, p in people.items() if n.endswith(pname) or pname.endswith(n)), None)
+        if target is None:
+            target = next((p for p in people.values() if p["change"] == "joins"), None)
+        if target is not None:
+            target["profile"] = _clip_words(prof, 60)
+    out = sorted(people.values(), key=lambda p: 0 if p["change"] == "joins" else 1)
+    return out
+
+
+def management_change(text: str, company: str | None = None) -> list[dict]:
+    people: list[dict] = []
+    if llm.available() and text:
+        res = llm.complete_json([
+            {"role": "system", "content": "Extract people from an Indian exchange filing about a management change. "
+                                          "Use only the filing text. JSON only."},
+            {"role": "user", "content": 'Return {"people":[{"name","role","change":"joins|leaves|retires",'
+                                        '"effective","reason","profile"}]} where profile is <=45 words taken from the '
+                                        f"filing's brief profile, or null.\n\n{text[:5000]}"},
+        ], tier="fast")
+        if isinstance(res, dict) and isinstance(res.get("people"), list):
+            for p in res["people"]:
+                if isinstance(p, dict) and p.get("name") and p["name"].split()[-1] in text:
+                    p["method"] = "llm"
+                    if p.get("profile"):
+                        p["profile"] = _clip_words(str(p["profile"]), 45)
+                    people.append(p)
     if not people:
-        people["?"] = {"name": None, "role": (re.search(_ROLE, blob, re.I) or [None, None])[1] if re.search(_ROLE, blob, re.I) else None,
-                       "change": "appointment" if re.search(r"appoint", blob, re.I) else "resignation" if re.search(r"resign", blob, re.I) else "change",
-                       "effective": None, "reason": None, "profile": None, "linkedin_search": None}
-    order = {"appointment": 0, "re-appointment": 0, "resignation": 1, "retirement": 1, "cessation": 1}
-    return {"people": sorted(people.values(), key=lambda p: order.get(p["change"], 2)), "method": "rules", "source": "filing text"}
+        people = management_change_rules(text)
+    for p in people:
+        p["linkedin_search"] = linkedin_search(p["name"], company)
+        p["profile_source"] = "Brief profile disclosed in the filing (SEBI LODR)" if p.get("profile") else None
+    people.sort(key=lambda p: 0 if p.get("change") == "joins" else 1)
+    return people
 
 
-def one_line_summary(subject: str, text: str | None, category: str) -> tuple[str, str]:
-    """(summary, method). Cheap model when available; otherwise a cleaned subject line."""
-    clean = re.sub(r"\s+", " ", subject).strip()
-    if text and llm.available() and category not in ("unclassified", "investor_meetings", "agm_egm", "postal_ballot"):
-        out = llm.complete(
-            [
-                {
-                    "role": "system",
-                    "content": "Summarise this Indian corporate filing for a busy investor in ONE sentence (<=28 words). "
-                    "State the concrete fact (what, how much, when). No adjectives, no speculation, no advice. "
-                    "If the text has no substantive content, repeat the subject plainly.",
-                },
-                {"role": "user", "content": f"Subject: {clean}\n\n{text[:3500]}"},
-            ],
-            tier="fast",
-            max_tokens=80,
-        )
-        if out:
-            return out.strip().strip('"'), "llm"
-    return clean[0].upper() + clean[1:] if clean else clean, "subject"
+_U = r"(crores?|cr\b|lakhs?|lacs?|millions?|mn\b|billions?|bn\b)"
+_AMT = re.compile(r"(?:Rs\.?|₹|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*(?:crores?|cr)?\s*(?:to|-|–)\s*(?:Rs\.?|₹|INR)?\s*"
+                  r"([0-9][0-9,]*(?:\.[0-9]+)?))?\s*" + _U, re.I)
+
+
+def amount_cr(text: str) -> Optional[float]:
+    """Largest ₹ amount in the text, in crore. Foreign-currency amounts are ignored."""
+    best = None
+    for m in _AMT.finditer(text or ""):
+        v = max(float(x.replace(",", "")) for x in (m.group(1), m.group(2)) if x)
+        unit = m.group(3).lower()
+        if unit.startswith("cr"):
+            cr = v
+        elif unit.startswith(("lakh", "lac")):
+            cr = v / 100
+        elif unit.startswith(("million", "mn")):
+            cr = v / 10
+        else:
+            cr = v * 100
+        best = cr if best is None else max(best, cr)
+    return round(best, 2) if best is not None else None

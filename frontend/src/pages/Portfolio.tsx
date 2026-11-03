@@ -1,110 +1,44 @@
-import { Plus, Search, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { Empty, ErrorState, ListSkeleton, PriorityTag, Segmented, Sparkline } from "../components/ui";
-import { api, del, post, useApi } from "../lib/api";
-import { pct, rupee, tone } from "../lib/format";
-import { go } from "../lib/router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Plus, X } from "lucide-react";
+import { api } from "../lib/api";
+import { pct, price, shortDate, tone } from "../lib/format";
+import { go, href } from "../lib/router";
+import { Button, Chip, Empty, ErrorBox, LoadingRows, PriorityDot, Spark, useAsync } from "../components/ui";
 
-type Sort = "signals" | "move" | "volume" | "name";
+type Sort = "signals" | "move" | "volume" | "az";
 
-export default function Portfolio() {
-  const { data, error, loading, reload } = useApi("/api/portfolio");
-  const [sector, setSector] = useState<string | null>(null);
-  const [sort, setSort] = useState<Sort>("signals");
-  const [edit, setEdit] = useState(false);
-
-  const items = useMemo(() => {
-    const xs = (data?.items ?? []).filter((i: any) => !sector || i.sector === sector);
-    const key: Record<Sort, (i: any) => number | string> = {
-      signals: (i) => -(i.top_score_7d ?? 0), move: (i) => -Math.abs(i.price?.return_pct ?? 0),
-      volume: (i) => -(i.price?.volume_ratio ?? 0), name: (i) => i.ticker,
-    };
-    return [...xs].sort((a, b) => (key[sort](a) < key[sort](b) ? -1 : 1));
-  }, [data, sector, sort]);
-
-  const day = data?.items?.[0]?.price?.date;
-  const avg = data?.items?.length ? data.items.reduce((s: number, i: any) => s + (i.price?.return_pct ?? 0), 0) / data.items.length : null;
-  const adv = data?.items?.filter((i: any) => (i.price?.return_pct ?? 0) > 0).length ?? 0;
-
-  return (
-    <div>
-      <div className="flex items-end justify-between gap-3">
-        <div>
-          <h1 className="w-semi text-[24px] font-semibold">Portfolio</h1>
-          {data && <div className="num text-[13px] text-dim">{data.count} holdings, equal-weight day move <span className={tone(avg)}>{pct(avg, true, 2)}</span>, {adv} up and {data.count - adv} down{day ? ` on ${new Date(day).toLocaleDateString("en-IN", { day: "numeric", month: "short" })} (EOD)` : ""}</div>}
-        </div>
-        <button onClick={() => setEdit(!edit)} className="text-[13px] text-info hover:underline">{edit ? "Done" : "Edit"}</button>
-      </div>
-
-      <AddTicker onAdded={reload} />
-
-      <div className="no-scrollbar -mx-4 mt-3 flex gap-2 overflow-x-auto px-4">
-        {[null, ...(data?.sectors ?? [])].map((s: string | null) => (
-          <button key={s ?? "all"} onClick={() => setSector(s)} className={`shrink-0 rounded-full border px-3 py-1 text-[12.5px] ${sector === s ? "border-fg bg-fg text-ink" : "border-line text-dim hover:text-fg"}`}>{s ?? "All sectors"}</button>
-        ))}
-      </div>
-      <div className="mt-3 flex items-center justify-between text-[12.5px] text-dim">
-        <span>Sort by</span>
-        <Segmented size="sm" value={sort} onChange={setSort} options={[{ value: "signals", label: "Signals" }, { value: "move", label: "Move" }, { value: "volume", label: "Volume" }, { value: "name", label: "A–Z" }]} />
-      </div>
-
-      <div className="mt-3">
-        {error && <ErrorState message={error} onRetry={reload} />}
-        {loading && !data && <ListSkeleton rows={6} />}
-        {data && items.length === 0 && <Empty title="No holdings yet">Add an NSE ticker above to start monitoring it.</Empty>}
-        <ul className="divide-y divide-line border-y border-line">
-          {items.map((i: any) => (
-            <li key={i.ticker} className="flex items-center gap-3 py-2.5">
-              <button onClick={() => go("research", i.ticker)} className="flex min-w-0 flex-1 items-center gap-3 text-left">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2"><span className="text-[14.5px] font-bold">{i.ticker}</span>{i.signals_7d > 0 && <PriorityTag p={i.top_score_7d >= 80 ? "critical" : i.top_score_7d >= 60 ? "high" : "medium"} />}</div>
-                  <div className="truncate text-[12px] text-dim">{i.name}</div>
-                </div>
-                <Sparkline data={i.spark} />
-                <div className="num w-[92px] shrink-0 text-right">
-                  <div className="text-[13.5px]">{rupee(i.price?.close)}</div>
-                  <div className={`text-[12.5px] ${tone(i.price?.return_pct)}`}>{pct(i.price?.return_pct, true, 2)}</div>
-                </div>
-                <div className="num hidden w-16 shrink-0 text-right text-[12.5px] sm:block">
-                  <div className={(i.price?.volume_ratio ?? 0) >= 2 ? "font-semibold text-warn" : "text-dim"}>{i.price?.volume_ratio?.toFixed(1) ?? "N/A"}×</div>
-                  <div className="text-[11px] text-faint">vol</div>
-                </div>
-              </button>
-              {edit && (
-                <button aria-label={`Remove ${i.ticker}`} onClick={() => { if (confirm(`Remove ${i.ticker} from the portfolio?`)) del(`/api/portfolio/${encodeURIComponent(i.ticker)}`).then(reload); }} className="rounded p-1.5 text-down hover:bg-down/10"><Trash2 className="h-4 w-4" /></button>
-              )}
-            </li>
-          ))}
-        </ul>
-        {data && <div className="mt-2 text-[11.5px] text-faint">End-of-day prices. Volume is today's volume divided by the 20-session average.</div>}
-      </div>
-    </div>
-  );
-}
-
-export function TickerSearch({ onPick, placeholder, cta }: { onPick: (t: string) => void; placeholder: string; cta: string }) {
+export function TickerSearch({ onPick, placeholder = "Add a company: ticker or name", autoFocus }:
+  { onPick: (t: string) => void; placeholder?: string; autoFocus?: boolean }) {
   const [q, setQ] = useState("");
-  const [hits, setHits] = useState<any[]>([]);
+  const [res, setRes] = useState<any[]>([]);
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0);
+  const t = useRef<number>();
   useEffect(() => {
-    if (!q.trim()) { setHits([]); return; }
-    const t = setTimeout(() => api(`/api/companies/search?q=${encodeURIComponent(q.trim())}`).then(setHits).catch(() => setHits([])), 150);
-    return () => clearTimeout(t);
+    window.clearTimeout(t.current);
+    if (!q.trim()) { setRes([]); return; }
+    t.current = window.setTimeout(() => api.search(q).then((r) => { setRes(r.results); setHi(0); }).catch(() => setRes([])), 140);
   }, [q]);
+  const pick = (x: any) => { onPick(x.ticker); setQ(""); setOpen(false); };
   return (
     <div className="relative">
-      <form onSubmit={(e) => { e.preventDefault(); if (q.trim()) { onPick((hits[0]?.ticker ?? q).toUpperCase()); setQ(""); } }}
-        className="flex items-center gap-2 rounded border border-line bg-surface px-3 focus-within:border-info">
-        <Search className="h-4 w-4 text-faint" />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} aria-label={placeholder} className="min-w-0 flex-1 bg-transparent py-2 text-[14px] placeholder:text-faint focus:outline-none" />
-        <button className="inline-flex items-center gap-1 text-[13px] font-semibold text-info"><Plus className="h-4 w-4" />{cta}</button>
-      </form>
-      {hits.length > 0 && (
-        <ul className="absolute inset-x-0 top-full z-20 mt-1 overflow-hidden rounded border border-line bg-raised shadow-xl">
-          {hits.map((h) => (
-            <li key={h.ticker}>
-              <button onClick={() => { onPick(h.ticker); setQ(""); setHits([]); }} className="flex w-full items-baseline gap-2 px-3 py-2 text-left hover:bg-surface">
-                <span className="text-[13.5px] font-bold">{h.ticker}</span><span className="truncate text-[12.5px] text-dim">{h.name}</span>
-                {h.in_portfolio && <span className="ml-auto shrink-0 text-[11px] text-up">Held</span>}
+      <input value={q} autoFocus={autoFocus} onChange={(e) => { setQ(e.target.value); setOpen(true); }} onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder={placeholder} aria-label={placeholder}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") { e.preventDefault(); setHi((h) => Math.min(h + 1, res.length - 1)); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setHi((h) => Math.max(h - 1, 0)); }
+          else if (e.key === "Enter" && res[hi]) { e.preventDefault(); pick(res[hi]); }
+        }}
+        className="w-full rounded border border-line bg-surface px-3 py-2.5 text-[15px] outline-none placeholder:text-faint focus:border-info/60" />
+      {open && res.length > 0 && (
+        <ul role="listbox" className="absolute z-20 mt-1 max-h-72 w-full overflow-auto rounded border border-line bg-raised py-1 shadow-xl">
+          {res.map((x, i) => (
+            <li key={x.ticker} role="option" aria-selected={i === hi}>
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => pick(x)}
+                className={`flex w-full items-baseline gap-2 px-3 py-2 text-left text-[14px] ${i === hi ? "bg-line/60" : ""}`}>
+                <span className="w-cond w-24 shrink-0 font-semibold">{x.ticker}</span>
+                <span className="min-w-0 flex-1 truncate text-dim">{x.name}</span>
+                {x.in_portfolio && <span className="text-[12px] text-faint">held</span>}
               </button>
             </li>
           ))}
@@ -114,15 +48,97 @@ export function TickerSearch({ onPick, placeholder, cta }: { onPick: (t: string)
   );
 }
 
-function AddTicker({ onAdded }: { onAdded: () => void }) {
+export default function Portfolio() {
+  const { data, error, loading, reload } = useAsync<any>(() => api.portfolio(), []);
+  const [sector, setSector] = useState("");
+  const [sort, setSort] = useState<Sort>("signals");
+  const [edit, setEdit] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+
+  const items = useMemo(() => {
+    let xs = (data?.items || []) as any[];
+    if (sector) xs = xs.filter((x) => x.sector === sector);
+    const by: Record<Sort, (a: any, b: any) => number> = {
+      signals: (a, b) => (b.top_score_7d || 0) - (a.top_score_7d || 0) || a.ticker.localeCompare(b.ticker),
+      move: (a, b) => Math.abs(b.price?.return_pct || 0) - Math.abs(a.price?.return_pct || 0),
+      volume: (a, b) => (b.price?.volume_ratio || 0) - (a.price?.volume_ratio || 0),
+      az: (a, b) => a.ticker.localeCompare(b.ticker),
+    };
+    return [...xs].sort(by[sort]);
+  }, [data, sector, sort]);
+
+  const add = async (t: string) => {
+    setMsg(null);
+    try { await api.addHolding(t); setMsg(`${t} added.`); reload(); }
+    catch (e: any) { setMsg(`Could not add ${t}: ${e.message}`); }
+  };
+  const remove = async (t: string) => {
+    if (!window.confirm(`Remove ${t} from your portfolio?`)) return;
+    try { await api.removeHolding(t); reload(); } catch (e: any) { setMsg(`Could not remove ${t}: ${e.message}`); }
+  };
+
+  const s = data?.summary;
   return (
-    <div className="mt-4">
-      <TickerSearch placeholder="Add an NSE ticker, e.g. TRENT" cta="Add" onPick={(t) => {
-        setMsg(null);
-        post("/api/portfolio", { ticker: t }).then(() => { setMsg(`Added ${t}.`); onAdded(); }).catch((e) => setMsg(e.message));
-      }} />
-      {msg && <div className="mt-1 text-[12.5px] text-dim">{msg}</div>}
+    <div>
+      <h1 className="w-semi text-[24px] font-bold">Portfolio</h1>
+      {s && (
+        <p className="mt-1 text-[14px] text-dim">
+          <span className="w-cond text-fg">{data.count}</span> holdings, equal-weight day move{" "}
+          <span className={`w-cond font-semibold ${tone(s.equal_weight_move)}`}>{pct(s.equal_weight_move, true, 2)}</span>,{" "}
+          <span className="w-cond">{s.up}</span> up and <span className="w-cond">{s.down}</span> down on {s.date ? shortDate(s.date) : "the last session"} (EOD)
+        </p>
+      )}
+      <div className="mt-4"><TickerSearch onPick={add} /></div>
+      {msg && <p className="mt-2 text-[13px] text-dim" role="status">{msg}</p>}
+
+      <div className="no-scrollbar mt-4 flex gap-1.5 overflow-x-auto">
+        <Chip active={!sector} onClick={() => setSector("")}>All</Chip>
+        {(data?.sectors || []).map((x: string) => <Chip key={x} active={sector === x} onClick={() => setSector(x)}>{x}</Chip>)}
+      </div>
+      <div className="mt-3 flex items-center gap-2 text-[13px]">
+        <label className="flex items-center gap-1.5 text-dim">Sort
+          <select value={sort} onChange={(e) => setSort(e.target.value as Sort)} className="rounded border border-line bg-surface px-2 py-1 text-fg">
+            <option value="signals">Signals</option><option value="move">Move</option><option value="volume">Volume</option><option value="az">A–Z</option>
+          </select></label>
+        <Button small className="ml-auto" onClick={() => setEdit(!edit)}>{edit ? "Done" : "Edit"}</Button>
+      </div>
+
+      {error && <div className="mt-4"><ErrorBox what="the portfolio" error={error} retry={reload} /></div>}
+      {loading && !data && <div className="mt-4"><LoadingRows n={6} /></div>}
+      {data && items.length === 0 && <div className="mt-4"><Empty title="No holdings yet">Search above to add NSE companies.</Empty></div>}
+      <ul className="hairline mt-3 border-y border-line">
+        {items.map((x) => {
+          const p = x.price;
+          return (
+            <li key={x.ticker} className="flex items-center gap-3 py-2.5">
+              {edit && (
+                <button onClick={() => remove(x.ticker)} aria-label={`Remove ${x.ticker}`} className="rounded p-1 text-down hover:bg-down/10"><X size={16} /></button>
+              )}
+              <a href={href(`research/${x.ticker}`)} onClick={(e) => { if (edit) e.preventDefault(); }} className="flex min-w-0 flex-1 items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-cond text-[15px] font-bold">{x.ticker}</span>
+                    {x.top_priority_7d && ["critical", "high"].includes(x.top_priority_7d) && <PriorityDot p={x.top_priority_7d} size={7} />}
+                    {x.signals_7d > 0 && <span className="text-[11px] text-dim">{x.signals_7d} signal{x.signals_7d > 1 ? "s" : ""}</span>}
+                  </div>
+                  <div className="truncate text-[12px] text-dim">{x.name}</div>
+                </div>
+                <Spark data={x.spark} width={64} height={24} />
+                <div className="w-[86px] shrink-0 text-right">
+                  <div className="w-cond text-[14px]">{p ? price(p.close) : "N/A"}</div>
+                  <div className={`w-cond text-[13px] font-semibold ${tone(p?.return_pct)}`}>{pct(p?.return_pct, true, 2)}</div>
+                </div>
+                <div className={`w-cond hidden w-12 shrink-0 text-right text-[13px] sm:block ${p?.volume_ratio >= 2 ? "font-semibold text-warn" : "text-dim"}`}>
+                  {p?.volume_ratio ? `${p.volume_ratio.toFixed(1)}×` : ""}
+                </div>
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="mt-3 text-[12px] text-faint">End-of-day prices. Volume is today against the 20-session average; amber at 2× or more. Not real-time.</p>
+      {edit && <p className="mt-1 text-[12px] text-faint">Removing a holding stops its filings appearing in the brief.</p>}
+      <div className="mt-6"><Button small onClick={() => go("research")}><Plus size={14} /> Research a company outside the portfolio</Button></div>
     </div>
   );
 }

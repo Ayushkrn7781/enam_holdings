@@ -1,52 +1,90 @@
-"""Indian fiscal-period helpers. FY27 = 1 Apr 2026 – 31 Mar 2027; Q1 = Apr–Jun."""
+"""Indian fiscal-period helpers. FY27 runs 1 Apr 2026 – 31 Mar 2027; Q1 = Apr–Jun."""
 from __future__ import annotations
 
 import calendar
 import re
 from datetime import date
+from typing import Optional
 
 
-def quarter_label(d: date) -> str:
-    q = {6: 1, 9: 2, 12: 3, 3: 4}.get(d.month)
-    fy = d.year + 1 if d.month > 3 else d.year
-    return f"Q{q} FY{fy % 100:02d}" if q else d.strftime("%b %Y")
+def month_end(y: int, m: int) -> date:
+    return date(y, m, calendar.monthrange(y, m)[1])
 
 
-def fy_label(d: date) -> str:
-    fy = d.year + 1 if d.month > 3 else d.year
-    return f"FY{fy % 100:02d}"
+def fy_of(d: date) -> int:
+    """Two-digit FY number for a date (Oct 2026 -> 27)."""
+    return (d.year + 1 if d.month >= 4 else d.year) % 100
 
 
-def fy_end(label: str) -> date | None:
-    m = re.fullmatch(r"FY\s?'?(\d{2}|\d{4})", label.strip(), re.I)
+def quarter_of(d: date) -> int:
+    return ((d.month - 4) % 12) // 3 + 1
+
+
+def quarter_label(period_end: date) -> str:
+    return f"Q{quarter_of(period_end)} FY{fy_of(period_end):02d}"
+
+
+def fy_label(period_end: date) -> str:
+    return f"FY{fy_of(period_end):02d}"
+
+
+def month_label(d: date) -> str:
+    return d.strftime("%b %Y")
+
+
+def _full_year(fy2: int) -> int:
+    return 2000 + fy2
+
+
+def fy_end(fy2: int) -> date:
+    return date(_full_year(fy2), 3, 31)
+
+
+def quarter_end(q: int, fy2: int) -> date:
+    y = _full_year(fy2)
+    return {1: date(y - 1, 6, 30), 2: date(y - 1, 9, 30), 3: date(y - 1, 12, 31), 4: date(y, 3, 31)}[q]
+
+
+def fy_quarter_ends(fy2: int) -> list[date]:
+    return [quarter_end(q, fy2) for q in (1, 2, 3, 4)]
+
+
+_Q = re.compile(r"Q([1-4])\s*FY\s*'?(\d{2,4})", re.I)
+_FY = re.compile(r"FY\s*'?(\d{2,4})", re.I)
+
+
+def parse_quarter(label: str) -> Optional[tuple[int, int]]:
+    m = _Q.search(label or "")
     if not m:
         return None
-    y = int(m.group(1))
-    y = y + 2000 if y < 100 else y
-    return date(y, 3, 31)
+    return int(m.group(1)), int(m.group(2)) % 100
 
 
-def quarter_end(label: str) -> date | None:
-    m = re.fullmatch(r"Q([1-4])\s?FY\s?'?(\d{2}|\d{4})", label.strip(), re.I)
-    if not m:
+def parse_fy(label: str) -> Optional[int]:
+    if parse_quarter(label):
         return None
-    q, y = int(m.group(1)), int(m.group(2))
-    y = y + 2000 if y < 100 else y
-    month = {1: 6, 2: 9, 3: 12, 4: 3}[q]
-    year = y - 1 if q in (1, 2, 3) else y
-    return date(year, month, calendar.monthrange(year, month)[1])
+    m = _FY.search(label or "")
+    return int(m.group(1)) % 100 if m else None
 
 
-def next_quarter(label: str) -> str | None:
-    d = quarter_end(label)
-    if not d:
+def next_quarter(label: str) -> Optional[str]:
+    pq = parse_quarter(label)
+    if not pq:
         return None
-    m = d.month + 3
-    y = d.year + (1 if m > 12 else 0)
-    m = m - 12 if m > 12 else m
-    return quarter_label(date(y, m, calendar.monthrange(y, m)[1]))
+    q, fy = pq
+    return f"Q1 FY{fy + 1:02d}" if q == 4 else f"Q{q + 1} FY{fy:02d}"
 
 
-def fy_of_quarter(label: str) -> str | None:
-    d = quarter_end(label)
-    return fy_label(d) if d else None
+def fy_of_label(label: str) -> Optional[int]:
+    pq = parse_quarter(label)
+    if pq:
+        return pq[1]
+    return parse_fy(label)
+
+
+def prev_quarter_end_before(year: int, month: int) -> date:
+    """Most recent quarter end strictly before the call month (transcript -> quarter discussed)."""
+    qm = ((month - 1) // 3) * 3
+    if qm == 0:
+        return date(year - 1, 12, 31)
+    return month_end(year, qm)

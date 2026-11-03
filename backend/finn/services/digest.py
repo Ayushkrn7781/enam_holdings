@@ -1,189 +1,137 @@
-"""Windowed portfolio digest — the morning brief. The executive summary is assembled from data, never generated."""
+"""Windowed digest. The headline and lines are assembled from computed data, never generated."""
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import now_ist
-from ..models import AlertEvent, AlertRule, Announcement, Company, Holding, Meta
-from .taxonomy import CATEGORIES
+from ..db import get_meta
+from ..models import AlertEvent, AlertRule, Announcement, Company, Holding
+from .alerts import anchor
+from .taxonomy import LABELS
+
+PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+MATERIAL = {"critical", "high", "medium"}
 
 
-def window_bounds(hours: int | None, start: datetime | None, end: datetime | None, anchor: datetime) -> tuple[datetime, datetime]:
-    end = end or anchor
-    start = start or end - timedelta(hours=hours or 24)
-    return start, end
+def why_rank(a: Announcement) -> str:
+    if a.is_duplicate_of is not None:
+        return "Duplicate of an earlier filing; suppressed"
+    b = a.score_breakdown or {}
+    fin, dev = b.get("financial", {}), b.get("deviation", {})
+    strongest = max((fin, dev), key=lambda c: c.get("value", 0))
+    if strongest.get("value", 0) >= 45:
+        return strongest.get("reason", "")
+    return (b.get("category") or {}).get("reason", "")
 
 
-def anchor_time(s: Session) -> datetime:
-    """'Now' for the digest, in IST (exchange timestamps are IST).
-    The demo dataset is frozen, so it anchors to its latest filing; live data uses the clock."""
-    latest = s.scalar(select(Announcement.published_at).order_by(Announcement.published_at.desc()).limit(1))
-    mode = s.get(Meta, "data_mode")
-    if mode and mode.value.get("mode") == "demo" and latest:
-        return latest + timedelta(minutes=1)
-    return now_ist()
-
-
-def _why_rank(br: dict | None) -> str | None:
-    """One line on what drives the score: the strongest of size / unusualness, else the category itself."""
-    if not br:
-        return None
-    if br.get("duplicate_of"):
-        return "Duplicate of an earlier filing — suppressed."
-    cands = [(br[k]["contribution"], br[k]["reason"]) for k in ("financial", "deviation") if k in br and br[k]["value"] >= 45]
-    if cands:
-        return max(cands)[1][0].upper() + max(cands)[1][1:]
-    r = br.get("category", {}).get("reason")
-    return r[0].upper() + r[1:] if r else None
-
-
-def serialize(a: Announcement, companies: dict[str, Company], holdings: set[str], full: bool = False) -> dict:
-    c = companies.get(a.ticker)
-    d = {
-        "id": a.id,
-        "ticker": a.ticker,
-        "company": c.name if c else a.ticker,
-        "sector": c.sector if c else None,
-        "in_portfolio": a.ticker in holdings,
-        "published_at": a.published_at.isoformat(),
-        "subject": a.subject,
-        "summary": a.summary,
-        "category": a.category,
-        "category_label": CATEGORIES.get(a.category or "unclassified", {}).get("label"),
-        "score": a.score,
-        "priority": a.priority,
+def serialize(a: Announcement, company: Optional[Company] = None, triage: Optional[str] = None,
+              detail: bool = False) -> dict[str, Any]:
+    enr = a.enrichment or {}
+    b = a.score_breakdown or {}
+    out: dict[str, Any] = {
+        "id": a.id, "ticker": a.ticker, "company": company.name if company else a.ticker,
+        "sector": company.sector if company else None, "published_at": a.published_at.isoformat(),
+        "subject": a.subject, "exchange_category": a.exchange_category, "category": a.category,
+        "category_label": LABELS.get(a.category or "", a.category), "subtype": a.subtype,
+        "category_method": a.category_method, "score": a.score, "priority": a.priority, "summary": a.summary,
+        "is_duplicate": a.is_duplicate_of is not None, "is_duplicate_of": a.is_duplicate_of, "source": a.source,
         "attachment_url": a.attachment_url,
-        "source": a.source,
-        "is_duplicate": a.is_duplicate_of is not None,
-        "subtype": (a.enrichment or {}).get("subtype"),
-        "has_results": bool((a.enrichment or {}).get("results")),
-        "has_bio": bool((a.enrichment or {}).get("management")),
-        "breakdown": {k: {"contribution": v["contribution"]} for k, v in (a.score_breakdown or {}).items() if isinstance(v, dict)},
-        "why_rank": _why_rank(a.score_breakdown),
+        "breakdown": [{"key": k, "label": v.get("label"), "contribution": v.get("contribution"),
+                       "value": v.get("value"), "weight": v.get("weight"), "reason": v.get("reason")}
+                      for k, v in b.items()],
+        "why_rank": why_rank(a), "triage": triage,
     }
-    if full:
-        d.update(
-            {
-                "exchange_category": a.exchange_category,
-                "score_breakdown": a.score_breakdown,
-                "enrichment": a.enrichment,
-                "category_method": a.category_method,
-                "body": (a.attachment_text or a.body or "")[:1500],
-            }
-        )
-    elif (a.enrichment or {}).get("results"):
-        r = a.enrichment["results"]
-        d["results_preview"] = [{k: row[k] for k in ("label", "current", "qoq_pct", "yoy_pct")} for row in r["rows"]]
-    elif (a.enrichment or {}).get("management"):
-        p = a.enrichment["management"]["people"][0]
-        d["bio_preview"] = {k: p.get(k) for k in ("name", "role", "change", "profile")}
-    return d
+    card = enr.get("results")
+    if card:
+        out["results_preview"] = {
+            "period_label": card.get("period_label"),
+            "verification": (card.get("verification") or {}).get("status"),
+            "rows": [{"key": r["key"], "label": r["label"], "yoy": r["yoy"], "qoq": r["qoq"], "current": r["current"]}
+                     for r in card["rows"]]}
+    people = enr.get("people") or []
+    if people:
+        p = people[0]
+        out["bio_preview"] = {"name": p.get("name"), "role": p.get("role"), "change": p.get("change"),
+                              "profile": p.get("profile")}
+    if detail:
+        out["body"] = a.body
+        out["attachment_text"] = a.attachment_text
+        out["enrichment"] = enr
+        out["score_breakdown"] = b
+    return out
 
 
-def build(
-    s: Session,
-    hours: int | None = 24,
-    start: datetime | None = None,
-    end: datetime | None = None,
-    tickers: list[str] | None = None,
-    sector: str | None = None,
-    categories: list[str] | None = None,
-    min_priority: str | None = None,
-    portfolio_only: bool = True,
-) -> dict:
-    anchor = anchor_time(s)
-    start, end = window_bounds(hours, start, end, anchor)
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    companies = {c.ticker: c for c in s.scalars(select(Company)).all()}
-    q = select(Announcement).where(Announcement.published_at >= start, Announcement.published_at <= end)
-    if portfolio_only:
-        q = q.where(Announcement.ticker.in_(holdings))
+def build(s: Session, hours: int = 24, start: Optional[datetime] = None, end: Optional[datetime] = None,
+          tickers: Optional[list[str]] = None, sector: Optional[str] = None, categories: Optional[list[str]] = None,
+          min_priority: Optional[str] = None) -> dict[str, Any]:
+    at = anchor(s)
+    end = end or at
+    start = start or (end - timedelta(hours=hours))
+    holdings = {h.ticker for h in s.scalars(select(Holding)).all()}
+    comps = {c.ticker: c for c in s.scalars(select(Company)).all()}
+    triage = get_meta(s, "triage", {}) or {}
+    q = select(Announcement).where(Announcement.published_at >= start, Announcement.published_at <= end,
+                                   Announcement.ticker.in_(holdings))
+    items = s.scalars(q).all()
     if tickers:
-        q = q.where(Announcement.ticker.in_(tickers))
+        items = [a for a in items if a.ticker in set(tickers)]
+    if sector:
+        items = [a for a in items if comps.get(a.ticker) and comps[a.ticker].sector == sector]
     if categories:
-        q = q.where(Announcement.category.in_(categories))
-    anns = [a for a in s.scalars(q).all() if not sector or (companies.get(a.ticker) and companies[a.ticker].sector == sector)]
-    order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
-    if min_priority:
-        anns = [a for a in anns if order.get(a.priority or "low", 0) >= order[min_priority]]
-    anns.sort(key=lambda a: (-(a.score or 0), a.published_at), reverse=False)
+        items = [a for a in items if a.category in set(categories)]
+    if min_priority in PRIORITY_ORDER:
+        items = [a for a in items if PRIORITY_ORDER.get(a.priority or "low", 3) <= PRIORITY_ORDER[min_priority]]
+    items.sort(key=lambda a: (-(a.score or 0), a.published_at))
+    material = [a for a in items if a.priority in MATERIAL and a.is_duplicate_of is None]
+    routine = [a for a in items if a not in material]
 
-    material = [a for a in anns if a.priority in ("critical", "high", "medium") and not a.is_duplicate_of]
-    routine = [a for a in anns if a not in material]
+    # EOD moves in the window
+    ev_rows = s.execute(select(AlertEvent, AlertRule).join(AlertRule, AlertRule.id == AlertEvent.rule_id)
+                        .where(AlertRule.kind.in_(["price_up", "price_down", "volume"]))).all()
+    moves = []
+    for e, r in ev_rows:
+        if e.ticker in holdings and start <= e.triggered_at <= end:
+            moves.append({"ticker": e.ticker, "kind": r.kind, "message": e.message, "value": e.value,
+                          "date": e.triggered_at.date().isoformat(), "priority": r.priority})
+    moves.sort(key=lambda m: (m["kind"] != "volume", -abs(m["value"] or 0)))
 
-    moves = s.execute(
-        select(AlertEvent, AlertRule)
-        .join(AlertRule, AlertRule.id == AlertEvent.rule_id)
-        .where(AlertRule.kind.in_(["volume", "price_up", "price_down"]), AlertEvent.triggered_at >= start - timedelta(hours=16), AlertEvent.triggered_at <= end)
-        .order_by(AlertEvent.triggered_at.desc())
-    ).all()
-    move_items = []
-    seen = set()
-    for ev, rule in moves:
-        if ev.ticker in seen and rule.kind != "volume":
-            continue
-        seen.add(ev.ticker)
-        move_items.append({"id": ev.id, "ticker": ev.ticker, "kind": rule.kind, "value": ev.value, "message": ev.message, "at": ev.triggered_at.isoformat()})
+    counts = Counter(a.priority for a in material)
+    counts_out = {"filings": len(items), "companies": len({a.ticker for a in items}),
+                  "critical": counts.get("critical", 0), "high": counts.get("high", 0),
+                  "medium": counts.get("medium", 0), "routine": len(routine)}
 
-    by_co: dict[str, float] = defaultdict(float)
+    lines: "OrderedDict[str, list[str]]" = OrderedDict()
     for a in material:
-        by_co[a.ticker] = max(by_co[a.ticker], a.score or 0)
-    top_cos = sorted(by_co.items(), key=lambda x: -x[1])[:5]
-
-    counts = Counter(a.priority for a in anns if not a.is_duplicate_of)
-    return {
-        "window": {"start": start.isoformat(), "end": end.isoformat(), "hours": round((end - start).total_seconds() / 3600)},
-        "anchored_to_dataset": anchor < now_ist() - timedelta(hours=1),
-        "counts": {
-            "total": len(anns),
-            "critical": counts.get("critical", 0),
-            "high": counts.get("high", 0),
-            "medium": counts.get("medium", 0),
-            "routine": len(routine),
-            "companies": len({a.ticker for a in anns}),
-        },
-        "executive_summary": (es := executive_summary(material, move_items, companies, len(anns)))["text"],
-        "headline": es["headline"],
-        "summary_lines": es["lines"],
-        "top_companies": [{"ticker": t, "company": companies[t].name if t in companies else t, "score": sc} for t, sc in top_cos],
-        "material": [serialize(a, companies, holdings) for a in material],
-        "routine": [serialize(a, companies, holdings) for a in routine],
-        "moves": move_items,
-    }
-
-
-def executive_summary(material: list[Announcement], moves: list[dict], companies: dict, total: int) -> dict:
-    """Assembled from counts and categories — no generation, so it can never claim something the data doesn't show.
-    Returns {headline, lines:[{label, tickers}], text}."""
-    names = lambda ts: list(dict.fromkeys(ts))  # noqa: E731
-    if not material and not moves:
-        h = f"Quiet window. {total} filing{'s' if total != 1 else ''}, none material."
-        return {"headline": h, "lines": [], "text": h}
-    top = [a for a in material if a.priority in ("critical", "high")]
-    rest = [a for a in material if a.priority == "medium"]
-    lines = []
-    if top:
-        by_cat: dict[str, list[str]] = defaultdict(list)
-        for a in sorted(top, key=lambda a: -(a.score or 0)):
-            by_cat[a.category].append(a.ticker)
-        for c, ts in by_cat.items():
-            lines.append({"label": CATEGORIES[c]["label"], "tickers": names(ts)})
-    vol = [m for m in moves if m["kind"] == "volume"]
-    px = [m for m in moves if m["kind"] != "volume"]
+        if a.priority in ("critical", "high"):
+            lbl = LABELS.get(a.category or "", a.category)
+            lines.setdefault(lbl, [])
+            if a.ticker not in lines[lbl]:
+                lines[lbl].append(a.ticker)
+    vol = sorted({m["ticker"] for m in moves if m["kind"] == "volume"})
+    px = sorted({m["ticker"] for m in moves if m["kind"] != "volume"} - set(vol))
+    line_list = [{"label": k, "tickers": v} for k, v in lines.items()]
     if vol:
-        lines.append({"label": "Unusual volume", "tickers": names(m["ticker"] for m in vol)})
+        line_list.append({"label": "Unusual volume", "tickers": vol})
     if px:
-        lines.append({"label": "Outsized price move", "tickers": names(m["ticker"] for m in px)})
-    n = len({a.ticker for a in top})
-    if n:
-        headline = f"{n} holding{'s' if n != 1 else ''} need{'s' if n == 1 else ''} your attention"
-    elif rest:
-        headline = f"Nothing urgent. {len(rest)} update{'s' if len(rest) != 1 else ''} worth a glance"
+        line_list.append({"label": "Outsized price move", "tickers": px})
+    attention = {a.ticker for a in material if a.priority in ("critical", "high")}
+    if attention:
+        headline = f"{len(attention)} holding{'s' if len(attention) != 1 else ''} need{'s' if len(attention) == 1 else ''} your attention"
     else:
-        headline = "No material filings; some unusual trading"
-    text = headline + ". " + "; ".join(f"{l['label'].lower()} ({', '.join(l['tickers'])})" for l in lines) + "."
-    return {"headline": headline, "lines": lines, "text": text}
+        headline = f"Nothing urgent. {len(material)} update{'s' if len(material) != 1 else ''} worth a glance"
+
+    top = Counter(a.ticker for a in material).most_common(5)
+    routine_by_cat = Counter(LABELS.get(a.category or "", a.category) for a in routine)
+    return {
+        "anchor": at.isoformat(), "window": {"start": start.isoformat(), "end": end.isoformat(), "hours": hours},
+        "headline": headline, "lines": line_list, "counts": counts_out,
+        "items": [serialize(a, comps.get(a.ticker), triage.get(str(a.id))) for a in material],
+        "routine": [serialize(a, comps.get(a.ticker), triage.get(str(a.id))) for a in routine],
+        "routine_summary": [{"label": k, "count": v} for k, v in routine_by_cat.most_common()],
+        "moves": moves, "top_companies": [{"ticker": t, "count": c} for t, c in top],
+        "data_mode": get_meta(s, "data_mode", "demo"),
+    }

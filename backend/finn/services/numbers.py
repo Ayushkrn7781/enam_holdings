@@ -1,96 +1,142 @@
-"""Deterministic financial arithmetic. The LLM never does maths in FINN — everything numeric goes through here."""
+"""Deterministic maths. The LLM never does arithmetic; everything numeric goes through here."""
 from __future__ import annotations
 
-import statistics
+import math
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence
+
+Num = Optional[float]
 
 
-def D(x) -> Decimal | None:
+def _d(x) -> Optional[Decimal]:
     if x is None:
         return None
     try:
         d = Decimal(str(x))
     except (InvalidOperation, ValueError):
         return None
-    return d if d.is_finite() else None
+    if d.is_nan() or d.is_infinite():
+        return None
+    return d
 
 
-def growth_pct(current, base) -> float | None:
-    """(current - base) / |base| * 100. N/A (None) when either side is missing or base is zero.
+def rnd(x, places: int = 1) -> Num:
+    d = _d(x)
+    if d is None:
+        return None
+    q = Decimal(1).scaleb(-places)
+    return float(d.quantize(q, rounding=ROUND_HALF_UP))
 
-    |base| in the denominator keeps the sign meaningful when a loss narrows (e.g. -100 -> -50 = +50%).
-    """
-    c, b = D(current), D(base)
+
+def growth_pct(cur, base) -> Num:
+    """(cur - base) / |base| * 100. A narrowed loss (-100 -> -50) reads +50%. None on missing/zero base."""
+    c, b = _d(cur), _d(base)
     if c is None or b is None or b == 0:
         return None
-    g = (c - b) / abs(b) * Decimal(100)
-    return float(g.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+    return rnd((c - b) / abs(b) * 100)
 
 
-def ratio(num, den, scale: float = 1.0, places: str = "0.01") -> float | None:
-    n, d = D(num), D(den)
-    if n is None or d is None or d == 0:
+def margin_pct(part, whole) -> Num:
+    p, w = _d(part), _d(whole)
+    if p is None or w is None or w == 0:
         return None
-    return float((n / d * Decimal(str(scale))).quantize(Decimal(places), rounding=ROUND_HALF_UP))
+    return rnd(p / w * 100)
 
 
-def margin_pct(profit, revenue) -> float | None:
-    return ratio(profit, revenue, 100, "0.1")
+def ratio(a, b, places: int = 2) -> Num:
+    x, y = _d(a), _d(b)
+    if x is None or y is None or y == 0:
+        return None
+    return rnd(x / y, places)
 
 
-def daily_return_pct(close, prev_close) -> float | None:
-    """(Current close / Previous close - 1) x 100"""
-    c, p = D(close), D(prev_close)
+def daily_return_pct(close, prev) -> Num:
+    c, p = _d(close), _d(prev)
     if c is None or p is None or p == 0:
         return None
-    return float(((c / p - 1) * 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    return rnd((c / p - 1) * 100, 2)
 
 
-def volume_ratio(volume, history: Sequence[float]) -> float | None:
-    """Current volume / mean of the trailing window (window excludes today)."""
-    hist = [h for h in history if h]
-    if not hist or not volume:
+def volume_ratio(today, trailing: Sequence[float]) -> Num:
+    """today / mean(trailing sessions). `trailing` must exclude today."""
+    vals = [v for v in trailing if v is not None]
+    if today is None or not vals:
         return None
-    return ratio(volume, statistics.fmean(hist), 1, "0.01")
-
-
-def zscore(value: float | None, history: Iterable[float | None]) -> float | None:
-    vals = [v for v in history if v is not None]
-    if value is None or len(vals) < 4:
+    m = sum(vals) / len(vals)
+    if m == 0:
         return None
-    sd = statistics.pstdev(vals)
-    if sd == 0:
+    return rnd(Decimal(str(today)) / Decimal(str(m)), 2)
+
+
+def mean(xs: Iterable[float]) -> Num:
+    v = [x for x in xs if x is not None]
+    return sum(v) / len(v) if v else None
+
+
+def stdev(xs: Iterable[float]) -> Num:
+    v = [x for x in xs if x is not None]
+    if len(v) < 2:
         return None
-    return round((value - statistics.fmean(vals)) / sd, 2)
+    m = sum(v) / len(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
 
 
-def cagr_pct(end, start, years: float) -> float | None:
-    e, s = D(end), D(start)
-    if e is None or s is None or s <= 0 or e <= 0 or years <= 0:
+def zscore(x, history: Sequence[float]) -> Num:
+    s = stdev(history)
+    m = mean(history)
+    if x is None or s is None or m is None or s == 0:
         return None
-    return round(((float(e) / float(s)) ** (1 / years) - 1) * 100, 1)
+    return rnd((x - m) / s, 2)
 
 
-def fmt_cr(x: float | None) -> str:
-    """Indian-style crore formatting: 12,34,567 Cr."""
-    if x is None:
-        return "N/A"
-    neg = x < 0
-    n = f"{abs(x):.0f}"
-    if len(n) > 3:
-        head, tail = n[:-3], n[-3:]
+def cagr_pct(end, start, years) -> Num:
+    e, s = _d(end), _d(start)
+    if e is None or s is None or not years or s <= 0 or e <= 0:
+        return None
+    return rnd(((float(e) / float(s)) ** (1 / years) - 1) * 100)
+
+
+def bps(cur, prev) -> Optional[int]:
+    if cur is None or prev is None:
+        return None
+    return int(Decimal(str((cur - prev) * 100)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def indian_group(n: int) -> str:
+    s = str(abs(n))
+    if len(s) <= 3:
+        out = s
+    else:
+        head, tail = s[:-3], s[-3:]
         parts = []
         while len(head) > 2:
             parts.insert(0, head[-2:])
             head = head[:-2]
         if head:
             parts.insert(0, head)
-        n = ",".join(parts + [tail])
-    return f"{'-' if neg else ''}₹{n} Cr"
+        out = ",".join(parts) + "," + tail
+    return ("-" if n < 0 else "") + out
 
 
-def fmt_pct(x: float | None, signed: bool = True) -> str:
+def fmt_cr(x, places: int = 0) -> str:
+    """₹12,34,567 Cr with Indian grouping."""
+    if x is None:
+        return "N/A"
+    d = _d(x)
+    q = d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    whole = int(abs(q))
+    frac = ""
+    if places:
+        frac = "." + f"{abs(q):.{places}f}".split(".")[1]
+    sign = "-" if q < 0 else ""
+    return f"{sign}₹{indian_group(whole)}{frac} Cr"
+
+
+def fmt_pct(x, signed: bool = True) -> str:
     if x is None:
         return "N/A"
     return f"{x:+.1f}%" if signed else f"{x:.1f}%"
+
+
+def clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, x))

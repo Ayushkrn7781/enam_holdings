@@ -1,257 +1,244 @@
-# FINN: Financial Investment Agent
+# FINN: a financial investment agent
 
-A mobile-first investment-intelligence prototype for the ENAM Holdings AI Engineer Build Challenge.
+FINN is a mobile-first prototype for the ENAM Holdings AI Engineer Build Challenge. It does two jobs for an investor:
 
-FINN watches a 20-stock NSE portfolio, ranks every exchange filing by an **explainable materiality score**, explains *why it matters* with evidence, and answers research questions **only from a company's own annual reports, concall transcripts and reported financials**. Its standout workflow is **Promise vs delivered**: management's guidance from the last four earnings calls, graded against what the company actually reported.
+- **Push.** It tells you what changed across a 20-stock NSE portfolio and why you should care. You get a windowed digest of exchange filings, ranked by an explainable materiality score, with routine paperwork collapsed. Quarterly results come with Revenue, EBITDA, PBT and PAT, QoQ and YoY, checked against the filing. A management change comes with the incoming person's background, read from the filing. You also get threshold alerts you set yourself.
+- **Pull.** You can research any NSE ticker using only primary documents: annual reports, concall transcripts and reported financials. The main workflow is **Promise vs delivered**. FINN takes management's guidance from the last four calls, extracts it verbatim, and grades it in Python against what the company actually reported.
 
-> **Data honesty.** The deployed demo runs on a clearly labelled **illustrative dataset**: synthetic figures and filings, fictional people, every row tagged `source=demo`, a "Demo data" badge on every screen, and a red watermark on every generated PDF page. Real data comes from `python -m finn.refresh` (Yahoo Finance, NSE, screener.in), run on a machine whose IP the exchanges don't block. The two never mix: a live refresh purges every demo row.
+The core rule is that **the LLM never does arithmetic.** Every growth rate, margin, ratio and score is computed in code. When the documents don't support an answer, FINN says so: *"I could not verify this claim from the available primary documents."*
 
----
+FINN runs with **zero API keys**. Every LLM feature has a deterministic fallback.
 
-## 1. Try it
-
-```bash
-# backend (Python 3.11+)
-cd backend
-pip install -r requirements.txt
-uvicorn finn.api.app:app --reload          # builds the demo dataset on first start → http://localhost:8000/docs
-
-# frontend (Node 20+)
-cd frontend
-npm install
-npm run dev                                # http://localhost:5173 (proxies /api to :8000)
-```
-
-**Deploy to Vercel** (frontend on the CDN, the FastAPI backend as one Python function, all on one URL):
+## Quick start
 
 ```bash
-cd finn                       # repo root, where vercel.json lives
-npx vercel@latest login       # once; opens the browser
-npx vercel@latest --prod      # accept the defaults; settings come from vercel.json
-npx vercel@latest env add GROQ_API_KEY production   # optional, then redeploy with --prod
+./run.sh local
 ```
 
-On Vercel the database lives in `/tmp`, copied from the prebuilt snapshot in `backend/seed/` on each cold start (~1 s). Triage swipes and alert edits therefore persist only while an instance is warm. That's fine for a demo; for persistence, point `DATABASE_URL` at a hosted Postgres. Live ingestion (`finn.refresh`) is meant to run on your own machine, because exchange sites block cloud IPs. After a live refresh, copy `backend/data/finn.db` (and `backend/data/docs/`) over `backend/seed/`, then redeploy, and the deployed app will show real data.
+Open <http://localhost:8000> and use the browser's phone view; the layout is designed mobile-first. This needs Python 3.11+ and Node 18+. The first run creates `backend/.venv`, builds the SPA and restores the prebuilt demo snapshot.
 
-Other hosts: single-URL production build: `cd frontend && npm run build`, then start uvicorn. FastAPI serves `frontend/dist` itself.
-The Docker image does both: `docker build -t finn . && docker run -p 8000:8000 finn`. `render.yaml` deploys it to Render's free tier.
+| Command | What it does |
+|---|---|
+| `./run.sh local` | Build and serve on `PORT` (default 8000) |
+| `./run.sh test` | 31 pytest tests plus the 27-question evaluation |
+| `./run.sh refresh [TICKERS]` | Pull live NSE, screener.in and Yahoo data for the portfolio, plus documents for the research names (default TRENT, HAL, PERSISTENT), then save the result as the seed snapshot |
+| `./run.sh snapshot` | Rebuild the illustrative demo snapshot in `backend/seed` |
+| `./run.sh deploy` | Push to GitHub and deploy to Render's free plan. It prompts for `RENDER_API_KEY` and an optional `GEMINI_API_KEY`, and never writes either to disk |
 
-**Optional:** set `GROQ_API_KEY` (free tier) to turn on LLM summaries, extraction and synthesis. Without a key, every feature still works through deterministic fallbacks. See `.env.example`.
+To turn on the language model, set `GEMINI_API_KEY` (free tier). See [.env.example](.env.example) for every variable.
 
-**Real data:**
+> **About the data.** The live connectors are built to the documented endpoints. NSE, screener.in and Yahoo often block cloud IPs, so out of the box FINN runs on a **clearly labelled illustrative demo dataset**:
+> - every row has `source="demo"`;
+> - every generated PDF page carries the watermark *"ILLUSTRATIVE DEMO DOCUMENT - NOT A REAL COMPANY FILING - FIGURES ARE SYNTHETIC"*;
+> - the UI shows a "Demo data" badge;
+> - the people named in filings are fictional.
+>
+> A live refresh purges every demo row, so live and demo data never mix.
 
-```bash
-cd backend
-python -m finn.refresh                          # prices (1y EOD) + 7 days of NSE filings + screener fundamentals
-python -m finn.refresh --research TRENT HAL     # also download & index annual report + last 4 concall transcripts
-python -m eval.run_eval                         # re-run the evaluation on whatever corpus is loaded
-pytest -q                                       # 33 unit + API tests
-```
+## How an investor uses it
 
-Schedule `finn.refresh` after market close (for example cron at 18:30 IST) to drive the end-of-day push cycle.
-
----
-
-## 2. The point of view: how an investor should use this
-
-Most "AI for investors" products aggregate and add a chat box. FINN starts from the brief's actual scarce skill, **filtering**, and builds the interaction around triage:
-
-| Moment | Interaction | Why |
+| Moment | What FINN does | Why it's built that way |
 |---|---|---|
-| **Morning, on the phone** | **The Brief**: a one-line headline built from the data ("5 holdings need your attention") with a ticker index under it, then a **triage deck**. Swipe right to *pin*, left once *seen*, tap for *Why should I care?* Routine filings are collapsed into one line. | The job is inbox-zero for filings. A deck makes you decide on each material item, and the ranking means you can stop after three cards. |
-| **"Why is this here?"** | Every card carries a **materiality strip**: the 0–100 score drawn as its five weighted contributions (category, financial size, unusualness, relevance to you, novelty). The detail page shows each component's rule and reason. | Trust comes from showing the ranking logic, not from asserting it. |
-| **A signal raises a question** | The detail page ends with **questions worth asking**. Tapping one sends it to **Ask FINN**, already scoped to that company. | Push flows straight into pull. |
-| **Digging in** | **Ask FINN** stays docked above the tab bar and follows whatever company you're looking at. Every answer shows **which engine answered it** (structured maths, guidance grading, health rules, or document retrieval), its citations (document, period, page, excerpt), and an evidence-strength breakdown. | The investor should always know whether a number was computed or read. |
-| **Judging management** | **Promise vs delivered**: hit rate, revisions, a guided-range-vs-reported chart, and every statement quoted verbatim with speaker, page and grade. | This is analysing management rather than summarising them, which the brief values most. |
+| 8:30 am, on the phone | **Brief.** One assembled headline ("5 holdings need your attention") and a definition list of what changed. Then a **triage deck**: swipe right to pin, left when seen, tap for *Why it matters*. | The scarce skill is filtering. The deck forces a decision on each material item, and the 7 routine filings stay collapsed. |
+| A card looks important | **Signal detail.** The *Why should I care?* panel separates fact (*confirmed from the filing*) from inference (*not a fact*) and lists what is still uncertain. It also shows the results card verified against the filing PDF, the people involved, the price around the filing, and **how FINN ranked it**. | Every rank can be explained. The five-segment **materiality strip** appears on every signal, and each segment is that component's contribution to the score. |
+| "Did they deliver?" | **Promise vs delivered.** A hit rate, a dumbbell chart of guided range against reported value, revisions ("18–20% → 15–17%, Q4 FY26 to Q1 FY27 call"), and every statement quoted verbatim with speaker and page. | This analyses management rather than summarising them. Grading is pure Python with a 0.05 pp tolerance. |
+| A follow-up question | **Ask FINN** is docked on every screen and already knows the company you're looking at. A router sends each question to the right engine and shows which one answered. | Numbers come from tables and narrative comes from cited passages. Each answer shows its evidence strength as factors, not as a fake probability. |
+| "Tell me if something moves" | **Alerts.** Thresholds for volume and price moves, plus filing-type rules, all editable inline. | You decide what "unusual" means. Monitoring is end-of-day, and the app says so. |
 
-Desktop gets a sidebar and a list view by default; everything is designed at 390 px first.
-
----
-
-## 3. Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph Sources["Primary sources (EOD)"]
-    YF[Yahoo Finance<br/>prices & volume]
-    NSE[NSE corporate<br/>announcements + PDFs]
-    SCR[screener.in<br/>financials + AR/concall links]
+  subgraph Sources
+    NSE[NSE announcements API]
+    SCR[screener.in financials + AR/concall PDFs]
+    YF[Yahoo Finance EOD]
+    DEMO[Illustrative demo dataset]
   end
-  subgraph Ingest["finn.refresh / on-demand ingest"]
-    C1[connectors/prices.py]
-    C2[connectors/nse.py]
-    C3[connectors/screener.py]
-    PDF[research/ingest.py<br/>PDF → pages → sections →<br/>speaker-aware chunks]
+  subgraph Push
+    TAX[Taxonomy: ordered regex rules then LLM fallback]
+    MAT[Materiality: 5 weighted components]
+    RES[Results parser + reconcile]
+    ENR[Enrich: people, amounts, reaction]
+    DIG[Digest + alerts]
   end
-  DB[(SQLite / Postgres<br/>provenance on every row)]
-  subgraph Push["Push engine"]
-    TAX[taxonomy.py<br/>rules → cheap LLM fallback]
-    RES[results.py<br/>SEBI-format PDF parser +<br/>Decimal QoQ/YoY + reconcile]
-    ENR[enrich.py<br/>appointee profile, amounts]
-    MAT[materiality.py<br/>5-component explainable score]
-    DIG[digest.py · alerts.py]
+  subgraph Pull
+    ING[Ingest: blocks to paragraphs to chunks]
+    RET[BM25 + optional dense, RRF]
+    GUI[Guidance extract + grade]
+    HEA[Health rules]
+    ANS[Router + verifier]
   end
-  subgraph Pull["Pull engine"]
-    RTR[answer.py router]
-    RET[retrieval.py<br/>BM25 + optional dense, RRF]
-    GUI[guidance.py<br/>extract → verbatim-verify →<br/>grade vs actuals]
-    HLT[health.py<br/>sector-aware rules]
-    VER[citation & number verifier]
-  end
-  LLM{{LLM gateway<br/>fast 8B / strong 70B<br/>content-addressed cache}}
-  UI[React PWA<br/>Brief · Portfolio · Research · Alerts]
-
-  YF --> C1 --> DB
-  NSE --> C2 --> DB
-  SCR --> C3 --> DB
-  C3 --> PDF --> DB
-  DB --> TAX --> ENR --> RES --> MAT --> DIG --> UI
-  DB --> RTR
-  RTR --> RET & GUI & HLT
-  RET --> VER --> UI
-  GUI --> UI
-  HLT --> UI
-  TAX -.-> LLM
-  ENR -.-> LLM
-  GUI -.-> LLM
-  VER -.-> LLM
+  LLM[(Gemini Flash-Lite / Flash, cached)]
+  DB[(SQLite WAL / Postgres)]
+  NSE & YF & SCR & DEMO --> DB
+  DB --> TAX --> ENR --> RES --> MAT --> DIG
+  SCR --> ING --> RET --> ANS
+  ING --> GUI --> ANS
+  DB --> HEA --> ANS
+  TAX -. fallback .-> LLM
+  ANS -. synthesis .-> LLM
+  GUI -. extraction .-> LLM
+  DIG & ANS --> API[FastAPI] --> SPA[React SPA, mobile-first]
 ```
 
-```
-backend/finn
-  api/app.py            FastAPI routes (thin): validation, pagination, structured errors, static SPA
-  connectors/           prices (yfinance) · nse (announcements + attachments) · screener (tables + documents)
-  services/             taxonomy · materiality · signals · results · enrich · market · digest · alerts · llm · pipeline · numbers
-  research/             ingest · retrieval · answer (router + RAG + verifier) · guidance · health · periods
-  demo.py               the illustrative dataset (planted scenarios; source="demo")
-  refresh.py / seed.py  CLIs
-backend/eval            questions.json (27 curated) + run_eval.py → results.json (shown in Settings)
-backend/tests           pytest: arithmetic, classifier, scoring, parser, guidance grading, verifier, API
-frontend/src            App shell · pages/{Brief, SignalDetail, Portfolio, Research, Alerts, Settings} · components/{Ask, ui}
-```
+- The backend is FastAPI, SQLAlchemy 2 on SQLite (WAL mode), `rank-bm25`, PyMuPDF, httpx and BeautifulSoup. It lives in `backend/finn`.
+- The frontend is React 18, Vite, TypeScript, Tailwind 3, Recharts and lucide-react, in `frontend/src`. The font is Archivo variable, and its width axis carries the hierarchy.
+- Deployment is one Docker image: a Node build stage, then a Python runtime that serves both the API and the SPA.
 
-### API (all JSON; OpenAPI at `/docs`)
+## API
 
-| Method | Route | Purpose |
-|---|---|---|
-| GET | `/api/digest?hours=24\|start&end&ticker&sector&category&min_priority` | Windowed brief: headline, counts, ranked material items, collapsed routine, EOD moves |
-| GET | `/api/signals?hours&priority&category&ticker&page&page_size` · `/api/signals/{id}` | Ranked feed (paginated) · full signal with score breakdown, *Why should I care?*, results card, people, price context |
-| POST | `/api/signals/{id}/triage` | `pin` / `dismiss` / `clear` |
-| GET/POST/DELETE | `/api/portfolio` · `/api/portfolio/{ticker}` | Holdings with EOD snapshot, sparkline, 7-day signal count |
-| GET | `/api/companies/search?q=` · `/api/companies/{t}` · `/prices` · `/financials` · `/announcements` | Any NSE symbol is accepted |
-| POST | `/api/research/query` `{ticker, question}` | Routed, cited answer + confidence factors + verification report |
-| GET | `/api/research/{t}` · `/documents` · `/management-guidance` · `/financial-health` · `/bull-bear` | Research views |
-| POST | `/api/research/{t}/ingest` | Fetch fundamentals + AR + last 4 transcripts for **any** ticker, then index |
-| GET/POST/PATCH/DELETE | `/api/alerts` · `/api/alerts/{id}` | Threshold rules + history |
-| GET/PUT | `/api/settings/materiality` | Weights (normalised, re-scores everything) |
-| GET | `/api/system/data-status` · `/api/system/eval` · POST `/api/system/demo-reset` | Source health, LLM usage, eval results |
+| Route | Purpose |
+|---|---|
+| `GET /api/health` | Liveness |
+| `GET /api/system/data-status` | Data mode, per-source status, counts, last EOD session, LLM stats, retrieval mode |
+| `POST /api/system/demo-reset` | Restore the snapshot, or rebuild the demo |
+| `GET /api/system/eval` | Latest evaluation results |
+| `GET /api/meta/categories` | The 17 categories and their importance |
+| `GET/POST/DELETE /api/portfolio[/{t}]` | Holdings with price snapshot, sparkline, 7-day signals and latest quarter |
+| `GET /api/companies/search?q=` | Known companies, plus "any NSE symbol" |
+| `GET /api/companies/{t}[/prices\|/financials\|/announcements]` | Company data |
+| `GET /api/digest` | Windowed digest: `hours`, `start`, `end`, `ticker[]`, `sector`, `category[]`, `min_priority` |
+| `GET /api/signals`, `GET /api/signals/{id}` | Paginated signals; full detail with price context and related filings |
+| `POST /api/signals/{id}/triage` | `pin`, `dismiss` or `clear` |
+| `POST /api/research/query` | `{ticker, question}`, routed, cited and verified |
+| `GET /api/research/{t}[/documents\|/management-guidance\|/financial-health\|/bull-bear]` | Research views |
+| `POST /api/research/{t}/ingest` | Background fetch of prices, fundamentals and documents (202) |
+| `GET /api/documents/{id}/file` | The PDF, inline |
+| `GET/POST/PATCH/DELETE /api/alerts[/{id}]`, `POST /api/alerts/seen` | Rules and history |
+| `GET/PUT /api/settings/materiality` | Weights; saving re-scores everything |
 
----
+## How it works
 
-## 4. How the important parts work
+### Materiality: explainable ranking
 
-### Materiality engine
-`Materiality = 0.25·Category + 0.25·Financial impact + 0.20·Deviation + 0.15·Relevance + 0.15·Novelty`, each 0–100 by a documented rule, never by an LLM:
+The score is a weighted sum of five components:
 
-* **Category:** base weight per category, adjusted by sub-type (a CEO/CFO change is 92 while a company-secretary change is 30; a rating *reaffirmation* is 20 while a *downgrade* is 85; a board-meeting *notice* is 30 while the results themselves are 90).
-* **Financial impact:** for results, the YoY PAT/revenue swing. Otherwise the ₹ amount extracted from the filing as a share of annual revenue (√-scaled). So L&T's ₹2,500–5,000 Cr order ranks *medium* (≈2% of revenue) and KPIT's ₹950 Cr acquisition ranks *critical* (≈16%).
-* **Deviation:** the larger of the results surprise vs the company's own last 8 quarters (z-score) and the EOD price/volume reaction vs its 20-day volatility. Capped for low-importance filings, so a postal-ballot notice doesn't take credit for an unrelated price move.
-* **Relevance:** portfolio membership, plus whether you have an alert on that category.
-* **Novelty:** token similarity to the company's earlier filings of the *same sub-type*. Duplicates are capped at 10; scheduled paperwork is capped at 30.
+`score = 0.25·Category + 0.25·Financial + 0.20·Deviation + 0.15·Relevance + 0.15·Novelty`
 
-Bands (critical ≥ 80, high ≥ 60, medium ≥ 35) are prototype defaults. Weights are editable in Settings, and everything is re-scored when they change.
+Each component is 0–100 and comes with a plain-English reason. The weights are editable in Settings, and saving re-scores every filing. The priority bands are critical ≥ 80, high ≥ 60, medium ≥ 35.
+
+- **Category.** Base importance for each of 17 categories, with sub-type overrides. For example, a CFO change scores 92 and a company-secretary change 30. A rating downgrade scores 85 and a reaffirmation 20. A board-meeting notice scores 30.
+- **Financial.** For results: `25 + max(|PAT YoY|, 1.5·|Rev YoY|)·2.5`. For anything with a ₹ amount, it is sized against annual revenue: `20 + 16·√(amount ÷ revenue × 100)·1.1`. That puts L&T's ₹5,000 Cr order at medium and KPIT's ₹950 Cr acquisition at critical.
+- **Deviation.** The largest of three signals:
+  - the results surprise (a z-score of PAT YoY against the last 8 quarters);
+  - the price reaction in σ on the first session after the filing (filings after 16:00 count for the next day);
+  - the volume reaction.
+
+  It is capped at 25 for low-importance filings, so a postal-ballot notice can't take credit for an unrelated move.
+- **Relevance.** 100 for a holding in a category you alert on, 75 for any other holding, 25 otherwise.
+- **Novelty.** One minus the Jaccard similarity to the same company's filings of the **same sub-type** over 90 days. Scheduled filings are capped at 30. Duplicates (similarity > 0.85 within 2 days) are capped at a score of 10.
 
 ### Financial accuracy
-* The LLM never does arithmetic. Growth, margins, ratios and the materiality score all run in `numbers.py` (Python `Decimal`). A zero or missing base shows **N/A**, never an invented percentage.
-* Results numbers come from **two independent sources that are reconciled**: the structured quarterly table, and the actual results PDF parsed by a deterministic SEBI-format row parser (current | preceding quarter | same quarter last year). That parser handles lakh/million/crore units, consolidated vs standalone, and EBITDA computed as PBT + finance cost + depreciation − other income. A disagreement above 2% is shown as **mismatch** with the likely cause. The cheap LLM reads the PDF only when the layout defeats the parser.
-* Sector awareness: for lenders, EBITDA, D/E, interest cover, working capital and cash conversion are switched off with an explanation, never computed meaninglessly. Exceptional items and other-income-heavy profit get flagged.
+
+- All maths lives in `services/numbers.py` and uses `Decimal` with `ROUND_HALF_UP`. A missing or zero denominator gives `N/A`, never an invented percentage. Growth uses `|base|`, so a narrowing loss reads as an improvement.
+- Results are cross-checked. A deterministic SEBI-format parser reads the results PDF: it handles lakh, million and crore units, prefers the consolidated basis, and skips the "Profit before exceptional items" row. It derives EBITDA as PBT + finance cost + depreciation − other income, then reconciles against the structured financials within max(₹1 Cr, 2%). The result is **verified** or a **mismatch** that names the metric.
+- Labels follow the Indian fiscal year (Q2 FY27 = Jul–Sep 2026). For banks and NBFCs, EBITDA is shown as N/A with the reason.
 
 ### Hallucination controls
-* **Router first.** Numeric questions never reach an LLM.
-* **Grounded prompts.** The model sees only numbered excerpts, must cite `[n]`, must use the exact refusal sentence when the evidence is missing, and is told not to use outside knowledge.
-* **Post-hoc verification.** Every sentence's `[n]` must point at a real excerpt, and every number in a sentence must appear in its cited excerpts; otherwise the sentence is tagged *unverified* in the UI.
-* **Verbatim guidance.** An LLM-extracted guidance quote that isn't found (≥ 85% longest-match) in its source chunk is dropped. If all are dropped, the rules extractor runs instead.
-* **Honest emptiness.** No documents, or no relevant evidence, returns *"I could not verify this claim from the available primary documents."*
-* **Confidence.** Shown as factors (retrieval relevance, evidence coverage, numeric verification, source quality), explicitly *not* a probability.
 
-Tested against a deliberately dishonest mock LLM: an invented "₹99,999 crore" was flagged unverified, and an invented guidance quote was rejected.
+1. **Routing.** Metric, multi-quarter, guidance and health questions never reach the LLM. They are answered from tables, with deterministic maths.
+2. **Evidence-only prompts.** Narrative answers may use only numbered excerpts, must cite `[n]` on every factual sentence, forbid outside knowledge and arithmetic, and must use the exact refusal sentence when the evidence is missing.
+3. **A verifier.** Every sentence's `[n]` must resolve to a real citation, and every number in the sentence must appear in the cited excerpts. If not, the sentence is tagged **unverified** in the UI. Tested against a mock that invents "Rs. 99,999 crore": the sentence is flagged.
+4. **Verbatim guidance.** An LLM-extracted quote must be a substring of its chunk, or have at least 85% of it matched. Otherwise it is dropped, and the rules extractor takes over when nothing survives. Tested against a mock that invents a quote.
+5. **Honest confidence.** Evidence strength combines retrieval relevance, coverage, numeric verification and source quality (0.6 for demo data). It is labelled *not a calibrated probability*.
 
 ### RAG
-PDFs are read as text blocks (paragraph boundaries survive). Repeated headers and footers are stripped, headings set the section, transcripts split on speaker turns, number-dense blocks are kept whole as `table` chunks, and chunks never cross a page, section or speaker boundary, so every citation has an exact page and speaker. Retrieval is BM25 with light stemming and finance query expansion ("debt" also searches "borrowings"), optional dense embeddings (fastembed/ONNX), and **Reciprocal Rank Fusion** (k = 60), with metadata filters (business questions search the annual report first).
+
+- **Ingestion.** PyMuPDF reads text blocks, then FINN strips running headers and furniture and groups lines into paragraphs. A heading must be a whole paragraph, and transcripts split on speaker turns. Chunks never cross a page, section or speaker boundary, and number-dense blocks become `table` chunks.
+- **Retrieval.** BM25 over section plus text, with a tiny stemmer, a finance query expansion (revenue → sales, topline…) and the company's own name dropped from the query. Optional dense retrieval with fastembed (`FINN_ENABLE_DENSE=1`) is fused using Reciprocal Rank Fusion.
+- **Sentence splitting** never breaks after "Rs.", "Mr." and similar abbreviations, so amounts survive intact.
 
 ### Promise vs delivered
-1. Keyword-filter management turns (moderators and analysts excluded), extract forward-looking statements (cheap LLM, or rules), and verify each quote verbatim.
-2. Classify each statement: metric; target band (`30% to 35%` → 30–35, `at least 15%` → ≥15, `around 20%` → 19.5–20.5); horizon (`FY27`, `Q1 FY27`, *next quarter* resolved from the call date, *medium term*); and commitment (explicit target, range, outlook or qualitative). Vague language is never turned into a number.
-3. Compute the actual in Python: full-year or quarterly growth or margin, summing four quarters if the annual row isn't published yet.
-4. Grade it (exceeded, achieved, missed, pending, long-dated, not comparable) and detect **revisions** (same metric and horizon, different target on a later call) and **repeated misses**.
-5. The strong model, if configured, writes a 3–4 sentence neutral interpretation of the *computed table only*. Otherwise a deterministic summary is used.
 
-### Generalising to unseen companies
-Nothing is keyed to the demo set. `POST /api/research/{ticker}/ingest` (or the "Fetch and index" button) resolves any NSE symbol, pulls screener tables and document links, downloads the latest AR and last four transcripts, indexes them, and extracts guidance. The research views then work exactly as for the demo names. Unknown sector? It falls back to the generic rules and says which metrics it couldn't assess.
+1. **Extract** forward-looking statements from the last four transcripts. This uses rules, or Flash-Lite with a verbatim check.
+   - Backward-looking sentences are skipped, so "revenue grew 16%" is not treated as guidance.
+   - Targets are parsed with care: "30% to 35%" → 30–35, "at least 30%" → ≥ 30, "around 20%" → 19.5–20.5, "Rs. 1,000 crore" capex.
+   - Horizons resolve to FY or quarter: "next quarter" said on the Q1 FY27 call → Q2 FY27, and "medium term" is long-dated.
+2. **Grade** in Python against the annual row, or the sum of four quarters, or that quarter's YoY. The grade is exceeded, achieved, missed, pending (k/4 quarters reported), long-dated or not comparable (capex).
+3. **Summarise** with a hit rate, revisions (same metric and horizon, a different target on a later call) and repeated misses. The interpretation is assembled deterministically. With a key, Flash rewrites it from the computed table only, in a neutral tone.
+
+On the demo corpus, TITAN comes out at a 33% hit rate: it missed FY26 growth (16.0% vs ~20%) and missed Q1 FY27 growth (10.2% vs 14–16%), and its FY27 growth guidance was revised **down** from 18–20% to 15–17%.
+
+### Financial health
+
+This is a rule-based early warning, explicitly *not* a probability of default. It checks 4 numeric pillars over up to 6 years: profitability, leverage, cash quality and working capital. It also text-detects disclosed risks from the annual report (auditor qualification, contingent liabilities, related parties, pledging), each with its excerpt and page.
+
+The overall label is **elevated** only when 2 or more pillars are elevated, so distress is never inferred from a single metric. For lenders the leverage and cash ratios are marked insufficient, with the reason.
+
+### Generalisation
+
+Nothing is hard-wired to the demo names. Any symbol matching `^[A-Z0-9&-]{1,20}$` works. "Fetch and index" calls yfinance for the profile and prices, then screener.in for financials and documents. It downloads the latest annual report and the last four transcripts (checking the `%PDF-` magic bytes), and maps each call month to the quarter it discusses. The same ingest, guidance and health pipeline then runs. A company with no documents gets the honest refusal, not a made-up answer.
 
 ### Cost discipline
-* Rules classify filings for free; the 8B model only sees what the rules leave unclassified (none in the demo set).
-* NSE attachments are downloaded only for non-routine filings.
-* One page, not the whole PDF, goes to the LLM for results extraction.
-* The 70B model is used only for synthesis and interpretation.
-* Every call is cached by `sha256(model + messages)` in a separate SQLite file, so re-runs and repeat questions cost nothing.
-* The whole demo runs with **zero** API calls.
 
----
+- Rules run first. The LLM classifies a filing only when no rule matches.
+- Model routing:
+  - **Flash-Lite** handles the classification fallback, summaries, bios, the results-page fallback and guidance extraction.
+  - **Flash** handles only narrative synthesis, the guidance interpretation and bull vs bear.
+  - Pro is never used; it left the free tier.
+- Models are resolved once per process from `/models`, skipping preview, image, tts and pro variants.
+- Responses are cached in a separate SQLite file. A cache inside the main DB had deadlocked against open write transactions. Rerunning the mock test made 0 calls and got 6 cache hits.
+- A 4.5 s throttle stays under the free tier's rate limit. 429s are retried with Retry-After. If the endpoint rejects JSON mode once, FINN stops trying it for the rest of the process.
+- Exchange attachments are downloaded only for categories that need the PDF.
 
-## 5. Evaluation (`python -m eval.run_eval`)
+## Evaluation
 
-27 curated questions (facts, numeric YoY/QoQ, multi-quarter, guidance grading, cross-document health, contradictory evidence, and insufficient-evidence traps) run through the real code path.
+`./run.sh test` runs `backend/eval/run_eval.py` over 27 questions: fact, guidance text, numeric, QoQ, guidance grading, trend and cross-document, insufficient evidence, and one contradiction. Results are in [backend/eval/results.json](backend/eval/results.json).
 
-| Metric | Result (demo corpus, LLM off) |
-|---|---|
-| Route accuracy | 100% (27) |
-| Retrieval Recall@5 | 100% (11) |
-| Citation validity (excerpt exists in a stored chunk) | 100% (27) |
-| Numeric accuracy vs independent recomputation | 100% (4) |
-| Guidance grading vs gold labels | 100% (4) |
-| Insufficient evidence handled honestly | 100% (3) |
-| Unverified-sentence rate | 0% |
-| Latency p50 / p95 | ~6 / ~19 ms |
+| Metric | Result | n |
+|---|---|---|
+| Route accuracy | 100% | 27 |
+| Recall@5 (gold passage in the top 5) | 100% | 11 |
+| Citation validity (excerpt exists in a stored chunk) | 100% | 15 |
+| Numeric accuracy (vs independent recomputation) | 100% | 4 |
+| Guidance grading counts | 100% | 4 |
+| Insufficient-evidence handling | 100% | 3 |
+| Unverified-sentence rate | 0% (extractive, no LLM) | — |
+| Latency p50 / p95 | ~1 ms / ~3 ms | 27 |
 
-**Read these honestly:** the demo corpus is small and was written alongside the questions, so this validates the *pipeline*, not real-world accuracy. The harness exists so the same numbers can be re-measured after `finn.refresh --research …` on real filings. Results are also shown in Settings → Evaluation.
+**Caveat.** This runs on the illustrative demo corpus, so it validates the pipeline end to end: routing, retrieval, citation, maths and grading. It does **not** measure real-world accuracy on live filings. Building the eval surfaced three real router bugs, which are fixed: "revenue mix" was routed to the metric engine, "quick-commerce delivery" matched "deliver" as guidance, and the ratios table leaked into extractive answers.
 
----
+## A 5-minute demo
 
-## 6. Five-minute demo script
+1. **Brief (phone width).** "5 holdings need your attention": Results for DIXON and TITAN, M&A for KPITTECH, a management change at SUNPHARMA, a fund raise at BHARTIARTL, and unusual volume. The count line reads 18 filings: 3 critical, 2 high, 6 medium, 7 routine collapsed.
+2. **Swipe the DIXON card right** to pin it. KPIT's ₹950 Cr acquisition comes up next, with a strip showing that it is 16.5% of annual revenue.
+3. **Open SUNPHARMA, then "Why it matters".** Ritika Sharan *joins as* CFO, with her profile from the filing and a LinkedIn search link; Kunal Mehrotra *leaves*. All names are fictional demo data.
+4. **Open DIXON.** Revenue is +38.0% YoY, and the card says *Verified against filing p.2, consolidated*. "How FINN ranked this" shows the scores 90, 100, 100, 100 and 70 with their reasons.
+5. **Go to Research, then TITAN, then Promise vs delivered.** The hit rate is 33%, the dumbbell shows two red misses, the FY27 guidance was revised down, and every quote is verbatim with its page.
+6. **Open the Health tab.** TITAN is **Elevated** in two pillars: 3-year CFO/PAT is 44%, and inventory days went from 205 to 262.
+7. **Ask FINN about TITAN.**
+   - "What was PAT growth YoY?" is answered by the deterministic engine.
+   - "What are the key risks?" is extractive and cited.
+   - Asking HAL "What are the key risks?" gives the refusal sentence, because no documents are indexed.
+8. **Alerts.** Change the volume threshold to 3× and the history re-derives. **Settings**: move the Novelty slider, then Save and re-score.
 
-1. **Brief (0:00–1:15).** Open on a phone. Read the headline and ticker index. Swipe the DIXON results card right (pin), then the KPIT M&A card left. Point at the materiality strip. Expand "7 routine filings" to show what was buried and why.
-2. **Why should I care? (1:15–2:30).** Open DIXON. Walk through: confirmed facts vs labelled inference, the +8.7σ price reaction, the results table **verified against the PDF (p.2)**, and the score breakdown table. Then open SUNPHARMA: the incoming CFO's profile, read from the filing itself.
-3. **Push → pull (2:30–3:30).** Tap "How does this quarter compare with what management guided last quarter?". Ask FINN opens scoped to the company, shows the route label, the answer, and citations with page and speaker.
-4. **Promise vs delivered (3:30–4:30).** Research → TITAN → *Promise vs delivered*: 33% hit rate, FY27 growth revised down from 18–20% to 15–17%, repeated revenue misses, every quote verbatim with page. Contrast TRENT, which is outside the portfolio, to show ad-hoc research.
-5. **Control (4:30–5:00).** Alerts: change the volume threshold from 2× to 1.5× and watch the history re-derive. Settings: move the materiality weights, show source status, the LLM tier split, and the eval panel.
+## What's built, deviations and why
 
----
+- **Built:** everything in the spec.
+  - Push: taxonomy, materiality, results parser and reconciliation, management-change bios, digest, alerts and triage.
+  - Pull: ingestion, hybrid retrieval, router plus verifier, promise vs delivered, health, overview and bull vs bear.
+  - Delivery: live connectors, the demo dataset, the API, a 6-screen mobile-first SPA, tests, eval, Docker, Render and `run.sh`.
+- **SQLite instead of Postgres/pgvector.** One file, zero setup, and the prebuilt snapshot is a single committed file. The code is Postgres-compatible: it uses dialect-aware upserts and takes `DATABASE_URL`.
+- **fastembed is optional.** BM25 with query expansion reaches 100% Recall@5 on this corpus. Dense retrieval adds an ONNX model download, which isn't worth it for a free-tier container.
+- **No shadcn.** About ten hand-built primitives keep the look intentional and the bundle smaller.
+- **Four tabs:** Brief, Portfolio, Research, Alerts. Settings sits behind the gear icon.
+- **No LinkedIn scraping.** LinkedIn's terms forbid it. SEBI LODR already requires a brief profile of an appointee in the filing itself, so FINN reads it from there and links to a LinkedIn people search.
+- **Demo price seed.** The synthetic random walk's seed salt (`PRICE_SALT` in `demo.py`) was chosen so the planted scenario reads as designed. For example, L&T's +2.4% move against its own volatility keeps its order at medium.
 
-## 7. What's built vs what's deliberately left out
+### Known limitations
 
-**Built and tested:**
-* Push: classification (17 categories plus sub-types), explainable scoring, windowed digest (24h / 3d / 7d / custom) with filters and routine collapse, results QoQ/YoY with PDF reconciliation, appointee bios, configurable price/volume/category alerts with history, and swipe triage.
-* Pull: PDF ingestion, hybrid retrieval, a routed and cited Q&A with verification, business and financial snapshots, trajectory, sector-aware health, promise vs delivered, bull vs bear.
-* Portfolio add/remove/search, the demo reset, and the evaluation harness.
+- **Live connectors not exercised here.** The NSE, screener.in and Yahoo connectors were not run against the real sites from this environment. They are built to the documented endpoints, with retries and per-source status reporting. Run `./run.sh refresh` from a residential connection to exercise them.
+- **LLM tested on a mock only.** Model resolution, 429 retry, the JSON-mode fallback, invented-number flagging, invented-quote rejection and caching were all verified against a mock OpenAI-compatible server, not the real Gemini API.
+- **Lender metrics.** NIM, GNPA and CAR aren't in the data source, so bank health is marked insufficient rather than guessed.
+- **Segment guidance.** Guidance is graded on consolidated numbers, and segment-level guidance is not yet separated.
+- **EOD only.** Alerts are not real-time, and the app says so.
 
-**Deviations from the original spec, and why:**
-* **SQLite, not Postgres + pgvector.** One file, zero setup, enough for a 20-name prototype. `DATABASE_URL` accepts Postgres; the only dialect-specific code (price upserts) handles both. Tables are created with `create_all`, not Alembic migrations.
-* **fastembed (ONNX), not sentence-transformers.** Torch doesn't fit a free hosting tier. Dense retrieval is optional; BM25 + RRF is the default. There is no cross-encoder reranker.
-* **Hand-built UI primitives instead of shadcn/ui.** Five small components didn't justify the dependency.
-* **Four mobile tabs, not seven.** "Overview" *is* the Brief, the signal feed is the Brief's list view, and financial health lives inside each company's research.
-* **No LinkedIn scraping.** It breaks LinkedIn's terms. SEBI LODR already requires a brief profile of the appointee *in the filing*, so FINN reads that and attaches a LinkedIn search link.
+### What's next
 
-**Known limitations:**
-* The live connectors (NSE, screener.in, yfinance) are written against those sites' public endpoints, but **could not be exercised against the live sites from the build environment** (blocked egress). Expect selector or endpoint tweaks on first real run, and the refresh reports per-source status rather than failing silently.
-* The LLM paths were tested against a mock OpenAI-compatible server, not live Groq.
-* Health checks for lenders need NIM, GNPA, CASA and CAR, which aren't in screener's standard tables.
-* Segment-level guidance can't be graded yet.
-* Monitoring is end-of-day by design; there is no real-time feed or push notifications.
-
-**Next:**
-* Scheduled refresh with web-push notifications for critical alerts.
-* Segment tables from investor presentations, so segment guidance can be graded.
-* A peer-comparison view with definition checks.
-* Real-corpus evaluation with analyst-labelled gold answers.
-* A per-user "what I care about" profile that learns from triage swipes and feeds the relevance weight.
+- An ingest worker on a schedule, with push notifications for critical items.
+- BSE filings, deduplicated against NSE.
+- Segment-level guidance and KPI tracking (volumes, store counts).
+- Narrative-vs-numbers contradiction detection across calls.
+- Lender-specific health rules from investor presentations.
+- A per-user portfolio and alerts behind sign-in.

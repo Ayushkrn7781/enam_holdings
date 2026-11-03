@@ -1,103 +1,100 @@
-"""Evaluation harness. Runs every curated question through the real API code path and scores it.
+"""Evaluation harness: route accuracy, Recall@5, citation validity, numeric accuracy, guidance grading,
+insufficient-evidence handling, unverified-sentence rate and latency. Writes eval/results.json.
 
-    python -m eval.run_eval            (from backend/)
-
-Metrics
-  route_accuracy       router picked the expected engine
-  recall_at_5          narrative questions: the gold evidence string is in the top-5 retrieved chunks
-  citation_validity    every citation's excerpt exists verbatim in a stored chunk of that company
-  numeric_accuracy     numeric answers match an independent recomputation from raw stored figures
-  guidance_grading     promise-vs-delivered status counts match the gold labels
-  insufficient_handled questions with no evidence return the explicit "could not verify" message
-  unverified_rate      share of answer sentences flagged by the numeric/citation verifier (hallucination proxy)
-  latency_ms           p50 / p95 end-to-end
-Results are written to eval/results.json and shown in the app (Settings -> Evaluation).
-The corpus is the ILLUSTRATIVE demo dataset unless live documents have been ingested.
+Run from backend/: python -m eval.run_eval
 """
+from __future__ import annotations
+
 import json
 import re
 import statistics
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 
-from finn.db import SessionLocal, init_db
-from finn.models import Chunk, Meta
-from finn.research import answer, retrieval
-from finn.services import llm
-from finn.services.numbers import growth_pct
+from finn.db import get_meta, init_db, session_scope
+from finn.models import Chunk, Company
+from finn.research import answer as A, guidance, retrieval
+from finn.services import llm, numbers as N
 from finn.services.results import periods
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent
 
 
-def main():
+def _independent(s, ticker: str, metric: str, basis: str):
+    """Recompute from raw rows, without going through results_card."""
+    qs = periods(s, ticker, "Q")
+    cur = qs[-1]
+    target = cur.period_end - timedelta(days=91 if basis == "qoq" else 365)
+    base = min(qs[:-1], key=lambda q: abs((q.period_end - target).days))
+    return N.growth_pct(cur.metrics.get(metric), base.metrics.get(metric))
+
+
+def main() -> None:
     init_db()
-    s = SessionLocal()
     qs = json.loads((HERE / "questions.json").read_text())
     rows, lat = [], []
-    for q in qs:
-        t0 = time.time()
-        out = answer.answer(s, q["ticker"], q["q"])
-        lat.append((time.time() - t0) * 1000)
-        r = {"id": q["id"], "type": q["type"], "ticker": q["ticker"], "question": q["q"], "route": out["route"], "route_ok": out["route"] == q["route"]}
-        if q["type"] in ("fact", "guidance_text"):
-            hits = retrieval.search(s, q["ticker"], q["q"], k=5)
-            r["recall_at_5"] = any(q["evidence"].lower() in c.text.lower() for c, _ in hits)
-        chunks = {c.text for c in s.scalars(select(Chunk).where(Chunk.ticker == q["ticker"]))}
-        cits = [c for c in out["citations"] if c.get("doc_type") not in ("financials",)]
-        r["citations"] = len(out["citations"])
-        r["citations_valid"] = all(any((c["excerpt"] or "")[:200] in t for t in chunks) or c.get("doc_type") == "transcript" and any(c["excerpt"][:120] in t for t in chunks) for c in cits)
-        if q["type"] == "numeric":
-            qq = periods(s, q["ticker"], "Q")
-            cur, prev = qq[-1], qq[-2]
-            base = prev if q["calc"] == "qoq" else next(x for x in qq if x.period_end.year == cur.period_end.year - 1 and x.period_end.month == cur.period_end.month)
-            expect = growth_pct(cur.metrics[q["metric"]], base.metrics[q["metric"]])
-            tag = "QoQ" if q["calc"] == "qoq" else "YoY"
-            m = re.search(rf"\*\*{ {'pat':'PAT','revenue':'Revenue','ebitda':'EBITDA','pbt':'PBT'}[q['metric']] }\*\*.*?{tag} ([+-]?\d+\.\d)%", out["answer"])
-            r["expected"], r["got"] = expect, float(m.group(1)) if m else None
-            r["numeric_ok"] = r["got"] is not None and abs(r["got"] - expect) < 0.05
-        if q["type"] in ("guidance", "contradiction"):
-            counts = out.get("data", {}).get("summary", {}).get("counts", {})
-            r["guidance_ok"] = all(counts.get(k, 0) == v for k, v in q["expect_status"].items())
-        if q.get("insufficient"):
-            r["insufficient_ok"] = "could not verify" in out["answer"].lower()
-        ver = out.get("verification") or {}
-        r["unverified_sentences"] = len(ver.get("unverified", []))
-        r["sentences"] = ver.get("sentences") or max(1, out["answer"].count("\n") + 1)
-        r["engine"] = out["engine"]
-        rows.append(r)
+    with session_scope() as s:
+        all_chunks = {c.text for c in s.scalars(select(Chunk)).all()}
+        mode = get_meta(s, "data_mode", "demo")
+        for q in qs:
+            t0 = time.perf_counter()
+            res = A.answer(s, q["ticker"], q["question"])
+            lat.append((time.perf_counter() - t0) * 1000)
+            r = {"id": q["id"], "type": q["type"], "ticker": q["ticker"], "question": q["question"],
+                 "route": res["route"], "route_ok": res["route"] == q["route"], "engine": res["engine"]}
+            cites = [c for c in res["citations"] if c.get("doc_type") not in ("financials",)]
+            r["citations_valid"] = all(any(c["text"] in ch for ch in all_chunks) for c in cites) if cites else None
+            if "gold" in q:
+                top = retrieval.search(s, q["ticker"], q["question"], k=5)
+                r["recall_at_5"] = any(q["gold"].lower() in h["text"].lower() for h in top)
+            if q["type"] == "numeric":
+                want = _independent(s, q["ticker"], q["metric"], q["basis"])
+                label = {"revenue": "Revenue", "ebitda": "EBITDA", "pbt": "PBT", "pat": "PAT"}[q["metric"]]
+                m = re.search(rf"\*\*{label}\*\*.*?{'QoQ' if q['basis'] == 'qoq' else 'YoY'} ([+-]\d+\.\d)%",
+                              res["answer"])
+                got = float(m.group(1)) if m else None
+                r.update(expected=want, got=got, numeric_ok=got is not None and want is not None and abs(got - want) < 0.05)
+            if q["type"] in ("guidance", "contradiction"):
+                summ = guidance.scorecard(s, q["ticker"])["summary"]
+                counts = {"missed": summ["missed"], "achieved": summ["met"], "exceeded": summ["beaten"]}
+                r["guidance_ok"] = all(counts[k] == v for k, v in q["expected"].items())
+                r["guidance_counts"] = counts
+            if q["type"] == "insufficient":
+                r["insufficient_ok"] = A.NOT_VERIFIED in res["answer"] and not res["citations"]
+            v = res.get("verification")
+            r["sentences"] = v["sentences"] if v else 0
+            r["unverified"] = v["unverified"] if v else 0
+            rows.append(r)
 
     def rate(key):
-        v = [r[key] for r in rows if key in r]
-        return {"value": round(sum(v) / len(v), 3) if v else None, "n": len(v)}
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return {"value": round(sum(bool(v) for v in vals) / len(vals), 3) if vals else None, "n": len(vals)}
 
-    mode = s.get(Meta, "data_mode")
-    res = {
-        "corpus": (mode.value.get("mode") if mode else "unknown"),
-        "llm": llm.stats()["configured"],
-        "generated_at": time.strftime("%Y-%m-%d %H:%M"),
-        "n_questions": len(rows),
-        "metrics": {
-            "route_accuracy": rate("route_ok"),
-            "recall_at_5": rate("recall_at_5"),
-            "citation_validity": rate("citations_valid"),
-            "numeric_accuracy": rate("numeric_ok"),
-            "guidance_grading": rate("guidance_ok"),
-            "insufficient_handled": rate("insufficient_ok"),
-            "unverified_rate": {"value": round(sum(r["unverified_sentences"] for r in rows) / max(1, sum(r["sentences"] for r in rows)), 3), "n": len(rows)},
-            "latency_ms": {"p50": round(statistics.median(lat)), "p95": round(sorted(lat)[int(0.95 * (len(lat) - 1))])},
-        },
-        "rows": rows,
-        "caveat": "Measured on the curated question set over the indexed corpus. With the demo corpus this validates the pipeline, not real-world accuracy; re-run after `python -m finn.refresh --research ...`.",
+    sent = sum(r["sentences"] for r in rows)
+    metrics = {
+        "route_accuracy": rate("route_ok"), "recall_at_5": rate("recall_at_5"),
+        "citation_validity": rate("citations_valid"), "numeric_accuracy": rate("numeric_ok"),
+        "guidance_grading": rate("guidance_ok"), "insufficient_evidence_handling": rate("insufficient_ok"),
+        "unverified_sentence_rate": {"value": round(sum(r["unverified"] for r in rows) / sent, 3) if sent else 0.0,
+                                     "n": sent},
+        "latency_ms": {"p50": round(statistics.median(lat), 1),
+                       "p95": round(sorted(lat)[max(0, int(len(lat) * 0.95) - 1)], 1)},
     }
-    (HERE / "results.json").write_text(json.dumps(res, indent=2, default=str))
-    print(json.dumps(res["metrics"], indent=2))
-    for r in rows:
-        bad = [k for k in ("route_ok", "recall_at_5", "citations_valid", "numeric_ok", "guidance_ok", "insufficient_ok") if r.get(k) is False]
-        if bad:
-            print("FAIL", r["id"], r["question"], bad, r.get("expected"), r.get("got"))
+    out = {"generated_at": datetime.now().isoformat(timespec="seconds"), "questions": len(rows),
+           "corpus_mode": mode, "llm": llm.available(), "metrics": metrics, "rows": rows,
+           "caveat": ("Run on the illustrative demo corpus: this validates the pipeline (routing, retrieval, citation, "
+                      "maths and grading) end to end, not real-world accuracy on live filings."
+                      + ("" if llm.available() else " LLM not configured: narrative answers are extractive."))}
+    (HERE / "results.json").write_text(json.dumps(out, indent=2, default=str))
+    for k, v in metrics.items():
+        print(f"{k:32} {v}")
+    fails = [r["id"] for r in rows if any(r.get(k) is False for k in
+                                          ("route_ok", "recall_at_5", "citations_valid", "numeric_ok", "guidance_ok",
+                                           "insufficient_ok"))]
+    print("failures:", fails or "none")
 
 
 if __name__ == "__main__":

@@ -1,273 +1,250 @@
-"""Quarterly results intelligence: Revenue, EBITDA, PBT, PAT — QoQ and YoY.
-
-Two independent sources are reconciled:
-  1. the structured quarterly table (screener.in, or demo data), and
-  2. the actual results filing PDF, parsed with a deterministic SEBI-format row parser
-     (columns: current quarter | preceding quarter | same quarter last year | ...),
-     with the cheap LLM only as a fallback for unusual layouts.
-All growth maths runs in `numbers.py` (Decimal). If the two sources disagree by >2%, the card says so.
-"""
+"""Results intelligence: structured quarter cards, a deterministic SEBI-format PDF parser, reconciliation."""
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import Company, FinancialPeriod
-from ..research.periods import quarter_label
+from ..research.periods import fy_label, month_label, quarter_label
 from . import llm
-from .numbers import growth_pct, margin_pct
+from . import numbers as N
 
-HEADLINE = ["revenue", "ebitda", "pbt", "pat"]
-LABELS = {"revenue": "Revenue", "ebitda": "EBITDA", "pbt": "PBT", "pat": "PAT"}
+HEADLINE = [("revenue", "Revenue"), ("ebitda", "EBITDA"), ("pbt", "PBT"), ("pat", "PAT")]
+LENDER_NOTE = ("Not meaningful for lenders: banks and NBFCs earn from interest spread, so EBITDA is not reported. "
+               "Use NIM, credit costs and asset quality instead.")
 
 
 def periods(s: Session, ticker: str, ptype: str = "Q") -> list[FinancialPeriod]:
-    rows = s.scalars(
-        select(FinancialPeriod)
-        .where(FinancialPeriod.ticker == ticker, FinancialPeriod.period_type == ptype)
-        .order_by(FinancialPeriod.period_end)
-    ).all()
-    # prefer consolidated if both bases exist
-    by_end: dict[date, FinancialPeriod] = {}
+    """Periods ascending, preferring the consolidated basis per period end."""
+    rows = s.scalars(select(FinancialPeriod).where(FinancialPeriod.ticker == ticker,
+                                                   FinancialPeriod.period_type == ptype)
+                     .order_by(FinancialPeriod.period_end)).all()
+    best: dict[date, FinancialPeriod] = {}
     for r in rows:
-        if r.period_end not in by_end or r.basis == "consolidated":
-            by_end[r.period_end] = r
-    return [by_end[k] for k in sorted(by_end)]
+        cur = best.get(r.period_end)
+        if cur is None or (r.basis == "consolidated" and cur.basis != "consolidated"):
+            best[r.period_end] = r
+    return [best[k] for k in sorted(best)]
 
 
-def _same_quarter_last_year(qs: list[FinancialPeriod], cur: FinancialPeriod) -> FinancialPeriod | None:
-    for q in qs:
-        if q.period_end.year == cur.period_end.year - 1 and q.period_end.month == cur.period_end.month:
-            return q
+def _find(rows: list[FinancialPeriod], target: date, tol_days: int = 20) -> Optional[FinancialPeriod]:
+    for r in rows:
+        if abs((r.period_end - target).days) <= tol_days:
+            return r
     return None
 
 
-def results_card(s: Session, ticker: str, period_end: date | None = None) -> dict | None:
+def _m(r: Optional[FinancialPeriod], k: str):
+    return (r.metrics or {}).get(k) if r else None
+
+
+def results_card(s: Session, ticker: str, period_end: Optional[date] = None) -> Optional[dict]:
     qs = periods(s, ticker, "Q")
     if not qs:
         return None
-    idx = len(qs) - 1
-    if period_end:
-        idx = next((i for i, q in enumerate(qs) if q.period_end == period_end), idx)
-    cur = qs[idx]
-    prev = qs[idx - 1] if idx > 0 else None
-    yoy = _same_quarter_last_year(qs, cur)
-    company = s.get(Company, ticker)
-    fin = bool(company and company.is_financial)
-
+    cur = _find(qs, period_end) if period_end else qs[-1]
+    if cur is None:
+        return None
+    prev = _find(qs, cur.period_end - timedelta(days=91))
+    ya = _find(qs, cur.period_end - timedelta(days=365))
+    comp = s.get(Company, ticker)
+    lender = bool(comp and comp.is_financial)
     rows = []
-    for k in HEADLINE:
-        c = cur.metrics.get(k)
-        p = prev.metrics.get(k) if prev else None
-        y = yoy.metrics.get(k) if yoy else None
-        note = None
-        if k == "ebitda" and fin:
-            note = "Not meaningful for lenders (interest is the core cost); shown as Operating/Financing profit where reported."
-        rows.append(
-            {
-                "metric": k,
-                "label": LABELS[k],
-                "current": c,
-                "previous": p,
-                "year_ago": y,
-                "qoq_pct": growth_pct(c, p),
-                "yoy_pct": growth_pct(c, y),
-                "note": note,
-            }
-        )
-    m_cur = margin_pct(cur.metrics.get("ebitda"), cur.metrics.get("revenue"))
-    m_yoy = margin_pct(yoy.metrics.get("ebitda"), yoy.metrics.get("revenue")) if yoy else None
-    m_prev = margin_pct(prev.metrics.get("ebitda"), prev.metrics.get("revenue")) if prev else None
-    pat_m_cur = margin_pct(cur.metrics.get("pat"), cur.metrics.get("revenue"))
-    pat_m_yoy = margin_pct(yoy.metrics.get("pat"), yoy.metrics.get("revenue")) if yoy else None
-
-    exceptional = cur.metrics.get("exceptional")
+    for key, label in HEADLINE:
+        c, p, y = _m(cur, key), _m(prev, key), _m(ya, key)
+        na = lender and key == "ebitda"
+        rows.append({"key": key, "label": label, "current": None if na else c, "previous": None if na else p,
+                     "year_ago": None if na else y, "qoq": None if na else N.growth_pct(c, p),
+                     "yoy": None if na else N.growth_pct(c, y), "note": LENDER_NOTE if na else None})
+    em = lambda r: None if lender else N.margin_pct(_m(r, "ebitda"), _m(r, "revenue"))  # noqa: E731
+    pm = lambda r: N.margin_pct(_m(r, "pat"), _m(r, "revenue"))  # noqa: E731
     flags = []
-    if exceptional:
-        flags.append(f"Exceptional items of ₹{exceptional:,.0f} Cr this quarter — PAT growth may not reflect the core business.")
-    if cur.metrics.get("other_income") and cur.metrics.get("pbt"):
-        share = cur.metrics["other_income"] / cur.metrics["pbt"] * 100 if cur.metrics["pbt"] else 0
-        if share > 25:
-            flags.append(f"Other income is {share:.0f}% of PBT — profit leans on non-operating income.")
-
-    trend = [
-        {
-            "label": quarter_label(q.period_end),
-            "revenue": q.metrics.get("revenue"),
-            "ebitda": q.metrics.get("ebitda"),
-            "pat": q.metrics.get("pat"),
-            "pbt": q.metrics.get("pbt"),
-            "ebitda_margin": margin_pct(q.metrics.get("ebitda"), q.metrics.get("revenue")),
-        }
-        for q in qs[max(0, idx - 7) : idx + 1]
-    ]
+    exc = _m(cur, "exceptional")
+    if exc not in (None, 0, 0.0):
+        flags.append(f"Exceptional items of {N.fmt_cr(exc)} this quarter")
+    oi, pbt = _m(cur, "other_income"), _m(cur, "pbt")
+    if oi and pbt and pbt > 0 and oi / pbt > 0.25:
+        flags.append(f"Other income is {oi / pbt:.0%} of PBT, so core profit is weaker than PBT suggests")
+    trend = []
+    for r in qs[-8:]:
+        trend.append({"label": quarter_label(r.period_end), "period_end": r.period_end.isoformat(),
+                      "revenue": _m(r, "revenue"), "pat": _m(r, "pat"), "ebitda_margin": em(r)})
     return {
-        "ticker": ticker,
-        "period": quarter_label(cur.period_end),
-        "period_end_label": cur.label,
-        "previous_period": quarter_label(prev.period_end) if prev else None,
-        "year_ago_period": quarter_label(yoy.period_end) if yoy else None,
-        "basis": cur.basis,
-        "unit": cur.unit,
-        "rows": rows,
-        "margins": {
-            "ebitda_margin": m_cur,
-            "ebitda_margin_prev": m_prev,
-            "ebitda_margin_yoy": m_yoy,
-            "ebitda_margin_change_bps_yoy": round((m_cur - m_yoy) * 100) if m_cur is not None and m_yoy is not None else None,
-            "pat_margin": pat_m_cur,
-            "pat_margin_yoy": pat_m_yoy,
-        },
-        "flags": flags,
-        "trend": trend,
-        "source": cur.source,
-        "source_url": cur.source_url,
-        "is_financial": fin,
+        "ticker": ticker, "period_end": cur.period_end.isoformat(), "period_label": quarter_label(cur.period_end),
+        "period_end_label": month_label(cur.period_end),
+        "previous_label": quarter_label(prev.period_end) if prev else None,
+        "year_ago_label": quarter_label(ya.period_end) if ya else None,
+        "basis": cur.basis, "unit": cur.unit, "source": cur.source, "source_url": cur.source_url,
+        "is_financial": lender, "rows": rows,
+        "margins": {"ebitda_margin": em(cur), "ebitda_margin_prev": em(prev), "ebitda_margin_year_ago": em(ya),
+                    "ebitda_margin_yoy_bps": N.bps(em(cur), em(ya)), "pat_margin": pm(cur)},
+        "lender_note": LENDER_NOTE if lender else None, "flags": flags, "trend": trend,
     }
 
 
-# ---------------------------------------------------------------- filing parser
+def card_from_filing(filing: dict, ticker: str, published: date, is_financial: bool) -> dict:
+    """Results card from the filing alone when no structured quarter is available (status single_source)."""
+    rows = []
+    for key, label in HEADLINE:
+        c, p, y = filing.get(key), filing.get(f"{key}_prev"), filing.get(f"{key}_ya")
+        na = is_financial and key == "ebitda"
+        rows.append({"key": key, "label": label, "current": None if na else c, "previous": None if na else p,
+                     "year_ago": None if na else y, "qoq": None if na else N.growth_pct(c, p),
+                     "yoy": None if na else N.growth_pct(c, y), "note": LENDER_NOTE if na else None})
+    em = None if is_financial else N.margin_pct(filing.get("ebitda"), filing.get("revenue"))
+    em_ya = None if is_financial else N.margin_pct(filing.get("ebitda_ya"), filing.get("revenue_ya"))
+    return {"ticker": ticker, "period_end": None, "period_label": "Latest quarter (from filing)",
+            "period_end_label": None, "basis": filing.get("basis"), "unit": "INR crore", "source": "pdf",
+            "is_financial": is_financial, "rows": rows,
+            "margins": {"ebitda_margin": em, "ebitda_margin_year_ago": em_ya, "ebitda_margin_yoy_bps": N.bps(em, em_ya),
+                        "pat_margin": N.margin_pct(filing.get("pat"), filing.get("revenue"))},
+            "lender_note": LENDER_NOTE if is_financial else None, "flags": [], "trend": [],
+            "verification": {"status": "single_source",
+                             "detail": "Built from the results filing alone; no structured financials to cross-check"}}
 
-_ROW_PATTERNS = {
-    "revenue": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?(revenue from operations|income from operations|total revenue from operations|net sales)",
-    "other_income": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?other income",
-    "finance_cost": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?(finance costs?|interest expenses?)",
-    "depreciation": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?depreciation",
-    "pbt": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?(profit|\(loss\)|profit\s*/\s*\(loss\)).{0,25}before tax",
-    "pat": r"^\s*(?:\(?[ivx]+\)?\.?\s*|\d+\.?\s*|[a-z]\)\s*)?((net )?profit|profit\s*/\s*\(loss\)).{0,40}(for the (period|quarter)|after tax)",
+
+# ---------------------------------------------------------------- PDF parser
+_NUM = r"\(?-?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d+)?\)?"
+_NUM_RE = re.compile(_NUM)
+_PFX = r"^\s*(?:\(?[ivx]+\)|\(?[a-h]\)|\d{1,2}[.)]?)?\s*"
+ROWS = {
+    "revenue": re.compile(_PFX + r"(revenue from operations|income from operations|net sales)\b", re.I),
+    "other_income": re.compile(_PFX + r"other income\b", re.I),
+    "interest": re.compile(_PFX + r"(finance costs?|interest expenses?)\b", re.I),
+    "depreciation": re.compile(_PFX + r"depreciation", re.I),
+    "pbt": re.compile(_PFX + r"(?!.*exceptional items and tax)(net\s+)?profit.{0,30}before tax", re.I),
+    "pat": re.compile(_PFX + r"(net\s+)?profit.{0,40}(for the period|after tax)", re.I),
 }
-_NUM = re.compile(r"\(?-?[\d,]+\.\d+\)?|\(?-?\d{1,3}(?:,\d{2,3})+\)?")
 
 
-def _to_num(tok: str) -> float:
-    neg = tok.startswith("(") or tok.startswith("-")
-    v = float(tok.strip("()").replace(",", "").lstrip("-"))
+def _to_num(tok: str) -> Optional[float]:
+    neg = tok.startswith("(") and tok.endswith(")")
+    t = tok.strip("()").replace(",", "")
+    try:
+        v = float(t)
+    except ValueError:
+        return None
     return -v if neg else v
 
 
-def _unit_divisor(text: str) -> tuple[float, str]:
-    t = text.lower()
-    if re.search(r"in\s*(rs\.?|₹|inr)?\s*lakhs?|lakhs", t):
-        return 100.0, "lakh"
-    if re.search(r"in\s*(rs\.?|₹|inr)?\s*millions?|\(million\)|in mn", t):
-        return 10.0, "million"
-    return 1.0, "crore"
-
-
-def parse_results_pages(pages: list[str]) -> dict | None:
-    """Deterministic parser for SEBI-format results statements. Returns cur/prev/yoy per metric + page."""
-    best = None
-    for pno, text in enumerate(pages, start=1):
-        if not re.search(r"before tax", text, re.I) or not re.search(r"revenue|income from operations", text, re.I):
+def _numbers(line: str) -> list[float]:
+    out = []
+    for m in _NUM_RE.finditer(line):
+        tok = m.group(0)
+        if "." not in tok and "," not in tok:  # bare integers: only Indian-grouped or decimals count
             continue
-        div, unit = _unit_divisor(text[:3000])
-        basis = "consolidated" if re.search(r"consolidated", text[:1500], re.I) else "standalone"
+        v = _to_num(tok)
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def _page_unit(text: str) -> float:
+    head = text[:2500].lower()
+    if "lakh" in head or "lac" in head:
+        return 0.01
+    if "million" in head:
+        return 0.1
+    return 1.0
+
+
+def parse_results_pages(pages: list[str]) -> Optional[dict]:
+    """Parse a SEBI-format results table. Returns current/prev/year-ago for the headline metrics (INR crore)."""
+    cands = []
+    for i, txt in enumerate(pages):
+        low = txt.lower()
+        if "before tax" in low and re.search(r"revenue|income from operations", low):
+            basis = "consolidated" if "consolidated" in low[:1500] else "standalone"
+            cands.append((0 if basis == "consolidated" else 1, i, basis))
+    for _, idx, basis in sorted(cands):
+        text = pages[idx]
+        unit = _page_unit(text)
+        lines = [ln.strip() for ln in text.splitlines()]
         found: dict[str, list[float]] = {}
-        for line in text.splitlines():
-            low = line.lower()
-            for key, pat in _ROW_PATTERNS.items():
-                if key in found or not re.search(pat, low):
+        for j, ln in enumerate(lines):
+            for key, rx in ROWS.items():
+                if key in found or not rx.search(ln):
                     continue
-                nums = [_to_num(t) for t in _NUM.findall(line)]
+                if key == "pbt" and re.search(r"exceptional items and tax", ln, re.I):
+                    continue
+                nums = _numbers(ln)
+                k = j + 1
+                while len(nums) < 3 and k < len(lines) and k <= j + 4:  # numbers may wrap onto following lines
+                    if any(r.search(lines[k]) for r in ROWS.values()):
+                        break
+                    nums += _numbers(lines[k])
+                    k += 1
                 if len(nums) >= 3:
-                    found[key] = [n / div for n in nums[:3]]
-        if {"revenue", "pbt", "pat"} <= found.keys():
-            cand = {"page": pno, "unit_in_filing": unit, "basis": basis, "values": found}
-            # Prefer consolidated statements when both are in the same PDF.
-            if best is None or (basis == "consolidated" and best["basis"] != "consolidated"):
-                best = cand
-    if not best:
-        return None
-    v = best["values"]
-    out = {}
-    for i, col in enumerate(["current", "previous", "year_ago"]):
-        ebitda = None
-        if all(k in v for k in ("pbt", "finance_cost", "depreciation")):
-            ebitda = v["pbt"][i] + v["finance_cost"][i] + v["depreciation"][i] - v.get("other_income", [0, 0, 0])[i]
-        out[col] = {
-            "revenue": round(v["revenue"][i], 2),
-            "ebitda": round(ebitda, 2) if ebitda is not None else None,
-            "pbt": round(v["pbt"][i], 2),
-            "pat": round(v["pat"][i], 2),
-        }
-    return {"page": best["page"], "basis": best["basis"], "unit_in_filing": best["unit_in_filing"], "method": "rules", **out}
-
-
-def llm_parse_results(pages: list[str]) -> dict | None:
-    """Fallback for non-standard layouts: cheap model reads only the single most relevant page."""
-    if not llm.available():
-        return None
-    scored = sorted(
-        enumerate(pages, 1),
-        key=lambda p: -len(re.findall(r"before tax|revenue|finance cost|depreciation", p[1], re.I)),
-    )
-    if not scored:
-        return None
-    pno, text = scored[0]
-    out = llm.complete_json(
-        [
-            {
-                "role": "system",
-                "content": "Extract numbers from an Indian quarterly results statement. Copy figures exactly as printed; "
-                "do not compute anything. Columns are usually: quarter ended (current), preceding quarter, corresponding quarter last year. "
-                'Reply JSON {"unit":"crore|lakh|million","basis":"consolidated|standalone","current":{"revenue":n,"other_income":n,"finance_cost":n,"depreciation":n,"pbt":n,"pat":n},"previous":{...},"year_ago":{...}}. Use null if absent.',
-            },
-            {"role": "user", "content": text[:6000]},
-        ],
-        tier="fast",
-        max_tokens=500,
-    )
-    if not out or "current" not in out:
-        return None
-    div = {"lakh": 100.0, "million": 10.0}.get(out.get("unit", "crore"), 1.0)
-    res = {"page": pno, "basis": out.get("basis"), "unit_in_filing": out.get("unit"), "method": "llm"}
-    for col in ("current", "previous", "year_ago"):
-        r = out.get(col) or {}
-        f = lambda k: (r.get(k) / div) if isinstance(r.get(k), (int, float)) else None  # noqa: E731
-        ebitda = None
-        if None not in (f("pbt"), f("finance_cost"), f("depreciation")):
-            ebitda = f("pbt") + f("finance_cost") + f("depreciation") - (f("other_income") or 0)
-        res[col] = {"revenue": f("revenue"), "ebitda": ebitda, "pbt": f("pbt"), "pat": f("pat")}
-    return res
-
-
-def card_from_filing(parsed: dict, period_label: str, source_url: str | None) -> dict:
-    rows = []
-    for k in HEADLINE:
-        c, p, y = (parsed[col].get(k) for col in ("current", "previous", "year_ago"))
-        rows.append({"metric": k, "label": LABELS[k], "current": c, "previous": p, "year_ago": y,
-                     "qoq_pct": growth_pct(c, p), "yoy_pct": growth_pct(c, y), "note": None})
-    return {
-        "period": period_label,
-        "basis": parsed.get("basis"),
-        "unit": "INR crore",
-        "rows": rows,
-        "source": "pdf",
-        "source_url": source_url,
-        "page": parsed.get("page"),
-        "method": parsed.get("method"),
-    }
-
-
-def reconcile(card: dict, filing: dict | None) -> dict:
-    """Cross-check structured-table numbers against the filing. Adds `verification` to the card."""
-    if not filing:
-        card["verification"] = {"status": "single_source", "detail": "Not cross-checked against the filing PDF."}
-        return card
-    mismatches = []
-    for row in card["rows"]:
-        fv = filing["current"].get(row["metric"])
-        if fv is None or row["current"] is None:
+                    found[key] = [n * unit for n in nums[:3]]
+        if not {"revenue", "pbt", "pat"} <= found.keys():
             continue
-        if abs(fv - row["current"]) > max(1.0, abs(row["current"]) * 0.02):
-            mismatches.append(f"{row['label']}: table {row['current']:,.0f} vs filing {fv:,.0f}")
-    card["verification"] = (
-        {"status": "verified", "detail": f"Matches the results filing (p.{filing['page']}, {filing['basis']}) within 2%."}
-        if not mismatches
-        else {"status": "mismatch", "detail": "; ".join(mismatches) + " — check basis (consolidated vs standalone) or restatement."}
-    )
-    card["filing_page"] = filing.get("page")
-    return card
+        out: dict[str, Any] = {"page": idx + 1, "basis": basis, "unit_factor": unit}
+        for slot, suf in ((0, ""), (1, "_prev"), (2, "_ya")):
+            g = lambda k: found[k][slot] if k in found else 0.0  # noqa: E731
+            for k in ("revenue", "other_income", "interest", "depreciation", "pbt", "pat"):
+                if k in found:
+                    out[k + suf] = round(found[k][slot], 2)
+            out["ebitda" + suf] = round(g("pbt") + g("interest") + g("depreciation") - g("other_income"), 2)
+        return out
+    return None
+
+
+def llm_read_page(pages: list[str]) -> Optional[dict]:
+    """Fallback: the fast LLM reads the single most relevant page (numbers only, no maths)."""
+    if not llm.available() or not pages:
+        return None
+    best = max(range(len(pages)), key=lambda i: sum(pages[i].lower().count(w) for w in
+                                                    ("revenue", "profit", "tax", "expenses")))
+    out = llm.complete_json([
+        {"role": "system", "content": "Copy numbers from an Indian results table. Do no arithmetic. JSON only."},
+        {"role": "user", "content": "From this page return JSON with keys revenue, other_income, interest, depreciation, "
+                                    "pbt, pat for the current quarter, each also with suffix _prev (preceding quarter) "
+                                    "and _ya (same quarter last year), in the units printed, plus unit "
+                                    f"('crore'|'lakh'|'million') and basis.\n\n{pages[best][:6000]}"},
+    ], tier="fast")
+    if not isinstance(out, dict):
+        return None
+    factor = {"lakh": 0.01, "million": 0.1}.get(str(out.get("unit", "")).lower(), 1.0)
+    res: dict[str, Any] = {"page": best + 1, "basis": out.get("basis") or "unknown", "method": "llm"}
+    for suf in ("", "_prev", "_ya"):
+        vals = {}
+        for k in ("revenue", "other_income", "interest", "depreciation", "pbt", "pat"):
+            try:
+                vals[k] = float(out.get(k + suf)) * factor
+            except (TypeError, ValueError):
+                vals[k] = None
+        for k, v in vals.items():
+            if v is not None:
+                res[k + suf] = round(v, 2)
+        if None not in (vals["pbt"], vals["interest"], vals["depreciation"], vals["other_income"]):
+            res["ebitda" + suf] = round(vals["pbt"] + vals["interest"] + vals["depreciation"] - vals["other_income"], 2)
+    return res if "revenue" in res and "pat" in res else None
+
+
+def reconcile(card: dict, filing: Optional[dict]) -> dict:
+    if not filing:
+        return {"status": "unverified", "detail": "No results table could be read from the filing"}
+    mism = []
+    checked = 0
+    for row in card["rows"]:
+        k = row["key"]
+        if row["current"] is None or filing.get(k) is None:
+            continue
+        checked += 1
+        a, b = row["current"], filing[k]
+        if abs(a - b) > max(1.0, 0.02 * abs(a)):
+            mism.append(f"{row['label']}: structured {N.fmt_cr(a)} vs filing {N.fmt_cr(b)}")
+    if not checked:
+        return {"status": "unverified", "detail": "No overlapping metrics to compare"}
+    where = f"p.{filing.get('page')}, {filing.get('basis')}"
+    if mism:
+        return {"status": "mismatch", "detail": "; ".join(mism) + " (check basis or restatement)", "page": filing.get("page")}
+    return {"status": "verified", "detail": f"Matches the results filing ({where}) within 2%", "page": filing.get("page")}
+
+
+def annual_label(d: date) -> str:
+    return fy_label(d)

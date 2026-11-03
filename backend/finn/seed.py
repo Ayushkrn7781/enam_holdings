@@ -1,11 +1,17 @@
-"""python -m finn.seed  — (re)build the clearly-labelled illustrative demo dataset."""
-import logging
+"""python -m finn.seed: create tables and build the illustrative demo dataset."""
+from __future__ import annotations
 
-from .db import init_db, session_scope
+import json
+
 from . import demo
+from .db import init_db, session_scope
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+def main() -> None:
     init_db()
     with session_scope() as s:
-        print(demo.reset(s))
+        print(json.dumps(demo.reset(s), indent=2))
+
+
+if __name__ == "__main__":
+    main()

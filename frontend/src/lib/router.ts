@@ -1,15 +1,28 @@
+// Hash routing: #/brief, #/signal/12, #/research/TITAN/guidance
 import { useEffect, useState } from "react";
 
-/** Tiny hash router: #/brief, #/signal/12, #/research/DIXON/guidance ... — deep-linkable, no server config. */
-export function useRoute() {
-  const parse = () => (window.location.hash.replace(/^#\/?/, "") || "brief").split("/").map(decodeURIComponent);
-  const [parts, setParts] = useState<string[]>(parse);
+export interface Route { name: string; params: string[] }
+
+export function parseHash(h: string = window.location.hash): Route {
+  const parts = h.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+  return { name: parts[0] || "brief", params: parts.slice(1) };
+}
+
+export function useRoute(): Route {
+  const [r, setR] = useState(parseHash());
   useEffect(() => {
-    const on = () => { setParts(parse()); window.scrollTo(0, 0); };
+    const on = () => {
+      setR(parseHash());
+      window.scrollTo({ top: 0 });
+    };
     window.addEventListener("hashchange", on);
     return () => window.removeEventListener("hashchange", on);
   }, []);
-  return parts;
+  return r;
 }
-export const go = (...parts: (string | number)[]) => { window.location.hash = "/" + parts.map((p) => encodeURIComponent(String(p))).join("/"); };
-export const back = () => (window.history.length > 1 ? window.history.back() : go("brief"));
+
+export function go(path: string) {
+  window.location.hash = path.startsWith("#") ? path : `#/${path.replace(/^\//, "")}`;
+}
+
+export const href = (path: string) => `#/${path.replace(/^\//, "")}`;

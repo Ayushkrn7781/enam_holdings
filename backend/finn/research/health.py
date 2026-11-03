@@ -1,176 +1,229 @@
-"""Financial-health early warning. Explainable rules over multi-year statements — not a credit model.
-
-Each check returns: metric, current value, history, direction, label (stable|monitor|elevated|insufficient),
-interpretation and source. The overall label needs signals in >=2 pillars before saying "Elevated":
-one bad metric alone never implies distress.
-"""
+"""Rule-based financial-health early warning. Explicitly NOT a probability of default."""
 from __future__ import annotations
+
+import re
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
 from ..models import Company
-from ..services.numbers import cagr_pct, growth_pct, margin_pct, ratio
-from ..services.results import periods
+from ..services import numbers as N
+from ..services.results import periods as fin_periods
 from . import retrieval
+from .periods import fy_label
+
+DISCLAIMER = ("A rule-based early-warning screen over reported financials and annual-report text. It is not a "
+              "credit rating and not a probability of default.")
+LENDER_NOTE = ("For banks and NBFCs, leverage, cash-flow and working-capital ratios are not meaningful. NIM, GNPA "
+               "and capital adequacy (CAR) are the right lenses, but they are not in this data source.")
 
 
-def _series(ys, key):
-    return [(y.label, y.metrics.get(key)) for y in ys]
-
-
-def _dir(vals: list[float | None]) -> str:
+def _dir(vals: list[float]) -> str:
     v = [x for x in vals if x is not None]
-    if len(v) < 2:
-        return "n/a"
-    if v[-1] > v[0] * 1.05 if v[0] >= 0 else v[-1] > v[0]:
-        return "rising"
-    if v[-1] < v[0] * 0.95 if v[0] >= 0 else v[-1] < v[0]:
-        return "falling"
-    return "flat"
+    if len(v) < 2 or v[0] == 0:
+        return "flat"
+    ch = (v[-1] - v[0]) / abs(v[0])
+    return "rising" if ch > 0.05 else "falling" if ch < -0.05 else "flat"
 
 
-def _check(pillar, metric, current, hist, label, interp, unit="", src=None, completeness=None):
-    return {
-        "pillar": pillar,
-        "metric": metric,
-        "current": current,
-        "unit": unit,
-        "history": hist,
-        "direction": _dir([h[1] for h in hist]) if hist else "n/a",
-        "label": label,
-        "interpretation": interp,
-        "source": src,
-        "completeness": completeness if completeness is not None else (sum(h[1] is not None for h in hist) / len(hist) if hist else 0),
-    }
+def _check(pillar, metric, current, unit, history, label, interp, source="financials", completeness=1.0, **extra):
+    return {"pillar": pillar, "metric": metric, "current": current, "unit": unit,
+            "history": [[h[0], h[1]] for h in history], "direction": _dir([h[1] for h in history]),
+            "label": label, "interpretation": interp, "source": source, "completeness": completeness, **extra}
 
 
-def analyse(s: Session, ticker: str) -> dict:
-    ys = periods(s, ticker, "Y")[-6:]
-    co = s.get(Company, ticker)
-    fin = bool(co and co.is_financial)
-    src = {"type": ys[-1].source, "url": ys[-1].source_url} if ys else None
+def _insufficient(pillar, metric, why):
+    return _check(pillar, metric, None, None, [], "insufficient", why, completeness=0.0)
+
+
+def assess(s: Session, ticker: str) -> dict[str, Any]:
+    comp = s.get(Company, ticker)
+    lender = bool(comp and comp.is_financial)
+    ys = fin_periods(s, ticker, "Y")[-6:]
+    if not ys:
+        return {"ticker": ticker, "overall": "insufficient", "reason": "No annual financials available.",
+                "pillars": [], "checks": [], "disclaimer": DISCLAIMER, "data_completeness": 0.0,
+                "lender_note": LENDER_NOTE if lender else None}
+    lab = [fy_label(y.period_end) for y in ys]
+    m = lambda k: [(y.metrics or {}).get(k) for y in ys]  # noqa: E731
+    rev, ebitda, pat, pbt, interest = m("revenue"), m("ebitda"), m("pat"), m("pbt"), m("interest")
+    nw, debt, cfo, cfi, fcf = m("net_worth"), m("borrowings"), m("cfo"), m("cfi"), m("fcf")
+    src = ys[-1].source
     checks: list[dict] = []
-    if len(ys) < 2:
-        return {"ticker": ticker, "overall": "insufficient", "checks": [], "note": "Fewer than two annual periods available.", "is_financial": fin}
 
-    rev = _series(ys, "revenue")
-    pat = _series(ys, "pat")
-    # ---------- profitability
-    g = cagr_pct(rev[-1][1], rev[0][1], len(rev) - 1)
-    last_g = growth_pct(rev[-1][1], rev[-2][1])
-    lbl = "insufficient" if g is None else ("elevated" if (last_g or 0) < -10 else "monitor" if (last_g or 0) < 0 else "stable")
-    checks.append(_check("Profitability", "Revenue growth", last_g, [(y.label, growth_pct(y.metrics.get("revenue"), p.metrics.get("revenue"))) for p, y in zip(ys, ys[1:])],
-                         lbl, f"{len(rev)-1}-yr revenue CAGR {g if g is not None else 'N/A'}%; latest year {last_g if last_g is not None else 'N/A'}%.", "%", src))
-    if not fin:
-        m = [(y.label, margin_pct(y.metrics.get("ebitda"), y.metrics.get("revenue"))) for y in ys]
-        mv = [x[1] for x in m if x[1] is not None]
-        delta = (mv[-1] - max(mv[:-1])) if len(mv) >= 3 else None
-        lbl = "insufficient" if delta is None else ("elevated" if delta < -5 else "monitor" if mv[-1] < mv[-2] - 1.5 else "stable")
-        checks.append(_check("Profitability", "EBITDA margin", mv[-1] if mv else None, m, lbl,
-                             "Margin vs. its recent peak" + (f": {delta:+.1f} pp." if delta is not None else "."), "%", src))
-    pm = [(y.label, margin_pct(y.metrics.get("pat"), y.metrics.get("revenue"))) for y in ys]
-    checks.append(_check("Profitability", "PAT margin", pm[-1][1], pm, "stable" if (pm[-1][1] or 0) > 0 else "elevated",
-                         "Bottom-line margin trend.", "%", src))
-    roe = _series(ys, "roe")
-    if any(v is not None for _, v in roe):
-        cur = roe[-1][1]
-        checks.append(_check("Profitability", "ROE", cur, roe, "insufficient" if cur is None else "monitor" if cur < 10 else "stable",
-                             "Return on shareholders' equity; <10% is weak for most Indian large caps.", "%", src))
-    roce = _series(ys, "roce")
-    if not fin and any(v is not None for _, v in roce):
-        cur = roce[-1][1]
-        checks.append(_check("Profitability", "ROCE", cur, roce, "insufficient" if cur is None else "monitor" if cur < 12 else "stable",
-                             "Return on capital employed; compare against cost of capital (~11–13%).", "%", src))
-
-    # ---------- leverage
-    if fin:
-        checks.append(_check("Leverage", "Debt / equity", None, [], "insufficient",
-                             "Not meaningful for lenders — borrowings are raw material. Capital adequacy, NIM and asset quality (GNPA) are the right lenses but are not in this data source.", "", src, 0))
+    # ---- profitability
+    growth = [(lab[i], N.growth_pct(rev[i], rev[i - 1])) for i in range(1, len(ys))]
+    g_last = growth[-1][1] if growth else None
+    cagr = N.cagr_pct(rev[-1], rev[0], len(ys) - 1) if len(ys) > 1 else None
+    if g_last is None:
+        checks.append(_insufficient("Profitability", "Revenue growth", "Need two years of revenue."))
     else:
-        de = [(y.label, ratio(y.metrics.get("borrowings"), y.metrics.get("net_worth"))) for y in ys]
-        cur = de[-1][1]
-        trend_up = len([x for x in de if x[1] is not None]) >= 3 and de[-1][1] is not None and de[-3][1] is not None and de[-1][1] > de[-3][1] + 0.3
-        lbl = "insufficient" if cur is None else "elevated" if cur > 1.5 else "monitor" if cur > 0.8 or trend_up else "stable"
-        checks.append(_check("Leverage", "Debt / equity", cur, de, lbl, "Total borrowings ÷ net worth." + (" Rising over 3 years." if trend_up else ""), "×", src))
-        ic = [(y.label, ratio((y.metrics.get("pbt") or 0) + (y.metrics.get("interest") or 0), y.metrics.get("interest"))) for y in ys]
-        cur = ic[-1][1]
-        lbl = "insufficient" if cur is None else "elevated" if cur < 2 else "monitor" if cur < 4 else "stable"
-        checks.append(_check("Leverage", "Interest coverage", cur, ic, lbl, "EBIT ÷ interest; <2× means a thin cushion if earnings dip.", "×", src))
-        bor = _series(ys, "borrowings")
-        checks.append(_check("Leverage", "Total debt", bor[-1][1], bor, "stable" if _dir([b[1] for b in bor]) != "rising" else "monitor",
-                             "Absolute borrowings trend (₹ Cr).", "₹ Cr", src))
+        lbl = "elevated" if g_last < -10 else "monitor" if g_last < 0 else "stable"
+        checks.append(_check("Profitability", "Revenue growth", g_last, "%", growth, lbl,
+                             f"Revenue {'fell' if g_last < 0 else 'grew'} {abs(g_last):.1f}% in {lab[-1]}"
+                             + (f"; {cagr:.1f}% a year over {len(ys) - 1} years." if cagr is not None else "."),
+                             source=src))
+    if not lender:
+        em = [(lab[i], N.margin_pct(ebitda[i], rev[i])) for i in range(len(ys))]
+        vals = [v for _, v in em if v is not None]
+        if vals:
+            cur, peak = vals[-1], max(vals)
+            prev = vals[-2] if len(vals) > 1 else cur
+            lbl = "elevated" if peak - cur > 5 else "monitor" if prev - cur > 1.5 else "stable"
+            checks.append(_check("Profitability", "EBITDA margin", cur, "%", em, lbl,
+                                 f"{cur:.1f}% versus a recent peak of {peak:.1f}%; {cur - prev:+.1f} pp YoY.", source=src))
+    pm = [(lab[i], N.margin_pct(pat[i], rev[i])) for i in range(len(ys))]
+    if pm[-1][1] is not None:
+        checks.append(_check("Profitability", "PAT margin", pm[-1][1], "%", pm, "stable",
+                             f"{pm[-1][1]:.1f}% of revenue reached the bottom line in {lab[-1]}.", source=src))
+    roe = [(lab[i], (ys[i].metrics or {}).get("roe")) for i in range(len(ys))]
+    if roe[-1][1] is not None:
+        checks.append(_check("Profitability", "ROE", roe[-1][1], "%", roe, "monitor" if roe[-1][1] < 10 else "stable",
+                             f"Return on equity {roe[-1][1]:.1f}%" + (" is below 10%." if roe[-1][1] < 10 else "."),
+                             source=src))
+    if not lender:
+        roce = [(lab[i], (ys[i].metrics or {}).get("roce")) for i in range(len(ys))]
+        if roce[-1][1] is not None:
+            checks.append(_check("Profitability", "ROCE", roce[-1][1], "%", roce,
+                                 "monitor" if roce[-1][1] < 12 else "stable",
+                                 f"Return on capital employed {roce[-1][1]:.1f}%"
+                                 + (" is below 12%." if roce[-1][1] < 12 else "."), source=src))
 
-    # ---------- cash quality
-    cfo = _series(ys, "cfo")
-    if any(v is not None for _, v in cfo):
-        n = min(3, len(ys))
-        sum_cfo = sum((y.metrics.get("cfo") or 0) for y in ys[-n:])
-        sum_pat = sum((y.metrics.get("pat") or 0) for y in ys[-n:])
-        conv = ratio(sum_cfo, sum_pat, 100, "0.1")
-        lbl = "insufficient" if conv is None else "elevated" if conv < 50 else "monitor" if conv < 80 else "stable"
-        if fin:
-            lbl, interp = "insufficient", "Operating cash flow of lenders swings with loan growth and deposits; conversion is not a meaningful quality test."
+    # ---- leverage
+    if lender:
+        for metric in ("Debt to equity", "Interest coverage", "Total debt"):
+            checks.append(_insufficient("Leverage", metric, LENDER_NOTE))
+    else:
+        de = [(lab[i], N.ratio(debt[i], nw[i])) for i in range(len(ys))]
+        dv = [v for _, v in de if v is not None]
+        if dv:
+            cur = dv[-1]
+            base3 = dv[-4] if len(dv) >= 4 else dv[0]
+            lbl = "elevated" if cur > 1.5 else "monitor" if (cur > 0.8 or cur - base3 > 0.3) else "stable"
+            checks.append(_check("Leverage", "Debt to equity", cur, "x", de, lbl,
+                                 f"Borrowings are {cur:.2f}× net worth"
+                                 + (f", up from {base3:.2f}× three years earlier." if cur - base3 > 0.05 else "."),
+                                 source=src))
+        ic = [(lab[i], N.ratio((pbt[i] or 0) + (interest[i] or 0), interest[i], 1) if interest[i] else None)
+              for i in range(len(ys))]
+        if ic[-1][1] is not None:
+            v = ic[-1][1]
+            checks.append(_check("Leverage", "Interest coverage", v, "x", ic,
+                                 "elevated" if v < 2 else "monitor" if v < 4 else "stable",
+                                 f"Operating profit covers interest {v:.1f}×.", source=src))
+        dh = [(lab[i], debt[i]) for i in range(len(ys)) if debt[i] is not None]
+        if dh:
+            d = _dir([v for _, v in dh])
+            checks.append(_check("Leverage", "Total debt", dh[-1][1], "INR cr", dh,
+                                 "monitor" if d == "rising" and dh[-1][1] > 0 else "stable",
+                                 f"Borrowings {N.fmt_cr(dh[-1][1])}, trend {d}.", source=src))
+
+    # ---- cash quality
+    if lender:
+        checks.append(_insufficient("Cash quality", "CFO / PAT", LENDER_NOTE))
+    else:
+        if all(v is not None for v in cfo[-3:]) and all(v is not None for v in pat[-3:]) and len(ys) >= 3:
+            conv = N.ratio(sum(cfo[-3:]), sum(pat[-3:]), 2)
+            hist = [(lab[i], N.ratio(cfo[i], pat[i], 2)) for i in range(len(ys))]
+            if conv is not None:
+                pct = conv * 100
+                checks.append(_check("Cash quality", "CFO / PAT (3-yr)", N.rnd(pct, 0), "%", hist,
+                                     "elevated" if pct < 50 else "monitor" if pct < 80 else "stable",
+                                     f"Over three years, {pct:.0f}% of reported profit arrived as operating cash.",
+                                     source=src))
+        f = [(lab[i], fcf[i] if fcf[i] is not None else ((cfo[i] or 0) + (cfi[i] or 0) if cfo[i] is not None else None))
+             for i in range(len(ys))]
+        last3 = [v for _, v in f[-3:] if v is not None]
+        if last3:
+            neg = sum(1 for v in last3 if v < 0)
+            checks.append(_check("Cash quality", "Free cash flow", f[-1][1], "INR cr", f,
+                                 "elevated" if neg >= 3 else "monitor" if neg == 2 else "stable",
+                                 f"Free cash flow (CFO + CFI proxy) was negative in {neg} of the last {len(last3)} years.",
+                                 source=src))
+
+    # ---- working capital
+    if lender:
+        checks.append(_insufficient("Working capital", "Cash conversion cycle", LENDER_NOTE))
+    else:
+        for key, metric, thr in (("debtor_days", "Receivable days", 20), ("inventory_days", "Inventory days", 25),
+                                 ("ccc", "Cash conversion cycle", 25)):
+            h = [(lab[i], (ys[i].metrics or {}).get(key)) for i in range(len(ys))]
+            vals = [v for _, v in h if v is not None]
+            if len(vals) < 2:
+                continue
+            cur, best = vals[-1], min(vals[:-1])
+            inc = cur - best
+            lbl = "elevated" if inc > 1.5 * thr else "monitor" if inc > thr else "stable"
+            if key == "inventory_days" and max(vals) == 0:
+                continue
+            checks.append(_check("Working capital", metric, cur, "days", h, lbl,
+                                 f"{cur:.0f} days versus a best of {best:.0f} in the period ({inc:+.0f})."
+                                 if inc > 0 else f"{cur:.0f} days, at or better than the period's best.", source=src))
+
+    # ---- disclosed risks (text-detected from the annual report)
+    checks += disclosed_risks(s, ticker)
+
+    # ---- overall
+    numeric = [c for c in checks if not c.get("text_detected")]
+    elevated_pillars = {c["pillar"] for c in numeric if c["label"] == "elevated"}
+    monitors = sum(1 for c in numeric if c["label"] == "monitor")
+    if len(elevated_pillars) >= 2:
+        overall = "elevated"
+        reason = f"Elevated signals in {len(elevated_pillars)} pillars: {', '.join(sorted(elevated_pillars))}."
+    elif elevated_pillars or monitors >= 3:
+        overall = "monitor"
+        reason = (f"Elevated signal in {next(iter(elevated_pillars))}" if elevated_pillars else
+                  f"{monitors} metrics to monitor") + "; not enough breadth to call it stress."
+    else:
+        overall = "stable"
+        reason = "No pillar shows an elevated signal" + (f"; {monitors} metric(s) to monitor." if monitors else ".")
+    complete = [c["completeness"] for c in numeric]
+    pillars = []
+    for p in ("Profitability", "Leverage", "Cash quality", "Working capital", "Disclosed risks"):
+        cs = [c for c in checks if c["pillar"] == p]
+        if cs:
+            rank = {"elevated": 3, "monitor": 2, "stable": 1, "insufficient": 0}
+            pillars.append({"pillar": p, "label": max(cs, key=lambda c: rank[c["label"]])["label"], "checks": cs})
+    return {"ticker": ticker, "overall": overall, "reason": reason, "pillars": pillars, "checks": checks,
+            "data_completeness": N.rnd(sum(complete) / len(complete), 2) if complete else 0.0,
+            "years": lab, "disclaimer": DISCLAIMER, "lender_note": LENDER_NOTE if lender else None,
+            "is_financial": lender, "source": src}
+
+
+RISK_PROBES = [
+    ("Auditor qualification", "independent auditor's report opinion qualified unmodified emphasis of matter",
+     r"basis for qualified opinion|adverse opinion", "elevated"),
+    ("Contingent liabilities", "contingent liabilities claims not acknowledged as debts guarantees", r"contingent liabilit",
+     "monitor"),
+    ("Related-party transactions", "related party transactions arm's length", r"related part", "monitor"),
+    ("Promoter pledging", "promoter shares pledged encumbered", r"pledg|encumb", "monitor"),
+]
+
+
+def disclosed_risks(s: Session, ticker: str) -> list[dict]:
+    out = []
+    for metric, query, pat, flag in RISK_PROBES:
+        hits = retrieval.search(s, ticker, query, k=3, doc_types=["annual_report"])
+        hit = next((h for h in hits if re.search(pat if metric != "Auditor qualification" else r"opinion", h["text"], re.I)),
+                   None)
+        if not hit:
+            continue
+        text = hit["text"]
+        if metric == "Auditor qualification":
+            bad = re.search(pat, text, re.I) and not re.search(r"opinion is not modified|not modified in respect", text, re.I)
+            label = "elevated" if bad else "stable"
+            interp = ("The auditor qualified the opinion; read the basis paragraph." if bad else
+                      "Unmodified audit opinion" + (" with an emphasis of matter (opinion not modified)."
+                                                    if re.search(r"emphasis of matter", text, re.I) else "."))
+        elif metric == "Promoter pledging":
+            nil = re.search(r"pledg\w*[^.]{0,40}\bnil\b|\bnil\b[^.]{0,40}pledg|no shares[^.]{0,30}pledg", text, re.I)
+            label = "stable" if nil else "monitor"
+            interp = "Promoter shares pledged: nil." if nil else "Promoter pledging disclosed; read this."
         else:
-            interp = f"{n}-yr cumulative CFO ÷ PAT. Persistent <80% means profits are not turning into cash."
-        checks.append(_check("Cash quality", "Cash conversion (CFO/PAT)", conv, [(y.label, ratio(y.metrics.get("cfo"), y.metrics.get("pat"), 100, "0.1")) for y in ys], lbl, interp, "%", src))
-        if not fin:
-            fcf = [(y.label, y.metrics.get("fcf") if y.metrics.get("fcf") is not None else ((y.metrics.get("cfo") or 0) + (y.metrics.get("cfi") or 0) if y.metrics.get("cfo") is not None and y.metrics.get("cfi") is not None else None)) for y in ys]
-            neg = sum(1 for _, v in fcf[-3:] if v is not None and v < 0)
-            checks.append(_check("Cash quality", "Free cash flow", fcf[-1][1], fcf, "elevated" if neg >= 3 else "monitor" if neg == 2 else "stable",
-                                 "CFO minus investing outflows (proxy where capex is not broken out). Negative FCF during a capex cycle is normal; persistent negative FCF is not.", "₹ Cr", src))
-
-    # ---------- working capital
-    if not fin:
-        for key, name, bad in (("debtor_days", "Receivable days", 20), ("inventory_days", "Inventory days", 25), ("ccc", "Cash conversion cycle", 25)):
-            sr = _series(ys, key)
-            vals = [v for _, v in sr if v is not None]
-            if len(vals) >= 2:
-                chg = vals[-1] - min(vals[:-1])
-                lbl = "elevated" if chg > bad * 1.5 else "monitor" if chg > bad else "stable"
-                checks.append(_check("Working capital", name, vals[-1], sr, lbl, f"{chg:+.0f} days vs. the best of the prior years.", "days", src))
-
-    # ---------- disclosed risks (text-detected from the annual report)
-    for metric, q in (
-        ("Auditor qualification", "qualified opinion basis for qualified opinion emphasis of matter"),
-        ("Contingent liabilities", "contingent liabilities claims not acknowledged as debts guarantees"),
-        ("Related-party transactions", "related party transactions material related party"),
-        ("Promoter pledging", "pledge encumbrance promoter shares pledged"),
-    ):
-        hits = retrieval.search(s, ticker, q, k=1, doc_types=["annual_report"])
-        if hits:
-            c, _ = hits[0]
-            text = c.text
-            lbl = "monitor"
-            if metric == "Auditor qualification":
-                lbl = "elevated" if "basis for qualified opinion" in text.lower() or "adverse opinion" in text.lower() else "stable"
-            if metric == "Promoter pledging" and ("nil" in text.lower() or "not pledged" in text.lower() or "no shares" in text.lower()):
-                lbl = "stable"
-            checks.append({
-                "pillar": "Disclosed risks", "metric": metric, "current": None, "unit": "", "history": [], "direction": "n/a",
-                "label": lbl, "interpretation": "Text-detected in the annual report — read the excerpt; FINN does not quantify this.",
-                "evidence": {"excerpt": text[:420], "page": c.page, "document": c.document.title, "url": c.document.url},
-                "source": {"type": "annual_report", "url": c.document.url}, "completeness": 0.5,
-            })
-        else:
-            checks.append({"pillar": "Disclosed risks", "metric": metric, "current": None, "unit": "", "history": [], "direction": "n/a",
-                           "label": "insufficient", "interpretation": "No indexed annual report text to check.", "source": None, "completeness": 0})
-
-    pillars_elev = {c["pillar"] for c in checks if c["label"] == "elevated"}
-    # text-detected disclosures are "read this" prompts, not quantitative stress signals
-    n_monitor = sum(c["label"] == "monitor" for c in checks if c["pillar"] != "Disclosed risks")
-    overall = "elevated" if len(pillars_elev) >= 2 else "monitor" if pillars_elev or n_monitor >= 3 else "stable"
-    known = [c for c in checks if c["label"] != "insufficient"]
-    return {
-        "ticker": ticker,
-        "is_financial": fin,
-        "overall": overall,
-        "overall_reason": (
-            f"Elevated signals in {', '.join(sorted(pillars_elev))}." if len(pillars_elev) >= 2
-            else f"{len(pillars_elev)} elevated and {n_monitor} monitor signal(s); no multi-pillar stress." if overall == "monitor"
-            else "No pillar shows stress."
-        ),
-        "data_completeness": round(len(known) / len(checks), 2) if checks else 0,
-        "periods": [y.label for y in ys],
-        "checks": checks,
-        "disclaimer": "Rule-based indicator for triage. Not a probability of default or a regulated credit-risk model.",
-    }
+            label = flag
+            interp = f"{metric} are disclosed in the notes; read this."
+        out.append(_check("Disclosed risks", metric, None, None, [], label, interp, source=hit["source"],
+                          text_detected=True,
+                          evidence={"excerpt": text[:420], "page": hit["page"], "document": hit["document"],
+                                    "document_id": hit["document_id"], "url": hit["url"]}))
+    return out

@@ -1,627 +1,714 @@
-"""ILLUSTRATIVE demo dataset — clearly labelled, never presented as real.
+"""Clearly labelled ILLUSTRATIVE demo dataset, used when live sources are unreachable.
 
-Why it exists: evaluators must be able to open FINN without API keys, and exchange sites block
-cloud IPs. Every row written here has source="demo"; every generated PDF page carries an
-"ILLUSTRATIVE DEMO DOCUMENT" header; the UI shows a persistent DEMO badge.
-
-Dates are relative to the day the dataset is generated (last weekday = latest EOD session).
-Planted scenarios exercise each workflow: a results beat (DIXON), a results miss with a
-margin squeeze and late filing (TITAN), a CFO change with appointee profile (SUNPHARMA),
-an acquisition (KPITTECH), an order win (LT), duplicate filings (TCS), routine noise, volume and
-price anomalies, and three companies with four quarters of transcripts for promise-vs-delivered.
-People named in demo filings are fictional.
+Every row has source="demo"; every generated PDF page carries a watermark; people are fictional.
+Frozen at DEMO_TODAY so the brief, alerts and guidance grading are reproducible.
 """
 from __future__ import annotations
 
-import calendar
 import hashlib
 import math
 import random
+import shutil
+import textwrap
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import (AlertEvent, AlertRule, Announcement, Chunk, Company, Document, FinancialPeriod, Guidance,
-                     Holding, Meta, Price, ResearchLog)
-from .universe import ADHOC, ALL, PORTFOLIO
+from .db import set_meta
+from .models import (AlertEvent, AlertRule, Announcement, Chunk, Company, Document, FinancialPeriod, Guidance, Holding,
+                     Meta, Price, ResearchLog)
+from .research import guidance as G, ingest
+from .research.periods import fy_label, month_end, month_label, quarter_label
+from .services import alerts, signals
+from .services.numbers import indian_group
+from .universe import PORTFOLIO, RESEARCH
 
-BANNER = "ILLUSTRATIVE DEMO DOCUMENT - NOT A REAL COMPANY FILING - FIGURES ARE SYNTHETIC"
+DEMO_TODAY = date(2026, 11, 3)
+WATERMARK = ingest.WATERMARK
+TAX = 0.252
+N_SESSIONS = 270
+QUARTER_ENDS = [month_end(2024 + (6 + 3 * i - 1) // 12, (6 + 3 * i - 1) % 12 + 1) for i in range(10)]  # Jun-24..Sep-26
+SEASON = {6: 0.96, 9: 1.00, 12: 1.06, 3: 0.98}
 
-# latest-quarter revenue (Rs cr), YoY growth, EBITDA margin %, D/E, CFO/PAT, debtor days, inventory days
-PROFILE = {
-    "RELIANCE": (258000, 0.07, 17.5, 0.42, 1.25, 12, 70), "HDFCBANK": (86000, 0.11, None, None, None, None, None),
-    "ICICIBANK": (49000, 0.12, None, None, None, None, None), "SBIN": (121000, 0.09, None, None, None, None, None),
-    "INFY": (44500, 0.06, 24.5, 0.05, 1.05, 68, 0), "TCS": (66500, 0.05, 27.0, 0.04, 1.02, 75, 0),
-    "KPITTECH": (1620, 0.14, 21.0, 0.10, 0.95, 62, 0), "TMPV": (98000, -0.03, 11.0, 0.65, 1.40, 18, 55),
-    "MARUTI": (40200, 0.09, 12.0, 0.01, 1.10, 9, 14), "M&M": (45800, 0.16, 14.0, 0.95, 0.85, 22, 45),
-    "LT": (67500, 0.12, 10.5, 1.10, 0.90, 95, 12), "ITC": (21200, 0.07, 35.0, 0.0, 1.05, 14, 160),
-    "HINDUNILVR": (16100, 0.03, 23.0, 0.0, 1.10, 12, 33), "SUNPHARMA": (14100, 0.09, 28.0, 0.02, 0.95, 95, 210),
-    "BHARTIARTL": (52500, 0.18, 55.0, 1.25, 1.80, 25, 0), "NTPC": (45200, 0.04, 28.0, 1.45, 1.70, 55, 40),
+# (revenue ₹ cr latest quarter, YoY growth, EBITDA margin %, D/E, CFO/PAT, debtor days, inventory days)
+PROFILES: dict[str, tuple] = {
+    "RELIANCE": (258000, 0.07, 17.5, 0.42, 1.25, 12, 70), "HDFCBANK": (86000, 0.11), "ICICIBANK": (49000, 0.12),
+    "SBIN": (121000, 0.09), "INFY": (44500, 0.06, 24.5, 0.05, 1.05, 68, 0), "TCS": (66500, 0.05, 27, 0.04, 1.02, 75, 0),
+    "KPITTECH": (1620, 0.14, 21, 0.10, 0.95, 62, 0), "TMPV": (98000, -0.03, 11, 0.65, 1.40, 18, 55),
+    "MARUTI": (40200, 0.09, 12, 0.01, 1.10, 9, 14), "M&M": (45800, 0.16, 14, 0.95, 0.85, 22, 45),
+    "LT": (67500, 0.12, 10.5, 1.10, 0.90, 95, 12), "ITC": (21200, 0.07, 35, 0, 1.05, 14, 160),
+    "HINDUNILVR": (16100, 0.03, 23, 0, 1.10, 12, 33), "SUNPHARMA": (14100, 0.09, 28, 0.02, 0.95, 95, 210),
+    "BHARTIARTL": (52500, 0.18, 55, 1.25, 1.80, 25, 0), "NTPC": (45200, 0.04, 28, 1.45, 1.70, 55, 40),
     "ASIANPAINT": (8600, -0.01, 18.5, 0.08, 1.15, 34, 105), "POLYCAB": (6700, 0.22, 13.5, 0.02, 0.75, 42, 85),
-    "PERSISTENT": (3750, 0.22, 17.0, 0.05, 1.00, 70, 0), "HAL": (7600, 0.11, 28.0, 0.0, 1.20, 80, 300),
-    "BAJFINANCE": (19500, 0.24, None, None, None, None, None), "DMART": (16800, 0.15, 8.0, 0.05, 0.90, 1, 30),
+    "PERSISTENT": (3750, 0.22, 17, 0.05, 1.0, 70, 0), "HAL": (7600, 0.11, 28, 0, 1.2, 80, 300),
+    "BAJFINANCE": (19500, 0.24), "DMART": (16800, 0.15, 8, 0.05, 0.9, 1, 30),
 }
 
-# Story companies: explicit quarterly paths (Q1 FY25 .. Q2 FY27) so guidance vs. actuals is meaningful.
 STORY = {
     "DIXON": {"rev": [6580, 11534, 10454, 10293, 12836, 14855, 13200, 12739, 15900, 20500],
-              "m":   [3.9, 3.7, 3.9, 4.1, 4.0, 3.7, 4.1, 4.2, 3.7, 4.0], "de": [0.12, 0.10, 0.15, 0.14, 0.11], "conv": 1.12,
-              "dd": [48, 45, 41, 38, 36], "inv": [28, 27, 25, 24, 22]},
+              "margin": [3.9, 3.7, 3.9, 4.1, 4.0, 3.7, 4.1, 4.2, 3.7, 4.0],
+              "de": [0.12, 0.10, 0.15, 0.14, 0.11], "cfo_pat": 1.12, "debtor": [48, 45, 42, 39, 36],
+              "inventory": [28, 27, 25, 24, 22], "payable": [62, 60, 60, 58, 57]},
     "TITAN": {"rev": [13266, 14656, 17740, 14916, 15520, 16830, 20560, 17370, 17100, 18300],
-              "m":   [11.0, 10.9, 11.6, 11.1, 11.2, 10.6, 11.9, 11.0, 10.9, 10.2], "de": [0.55, 0.62, 0.78, 0.95, 1.18], "conv": 0.42,
-              "dd": [5, 5, 6, 6, 7], "inv": [205, 210, 222, 236, 262]},
+              "margin": [11.0, 10.9, 11.6, 11.1, 11.2, 10.6, 11.9, 11.0, 10.9, 10.2],
+              "de": [0.55, 0.62, 0.78, 0.95, 1.18], "cfo_pat": 0.42, "debtor": [6, 5, 7, 6, 6],
+              "inventory": [205, 210, 222, 236, 262], "payable": [20, 20, 20, 20, 20], "cfi_mult": 1.6},
     "TRENT": {"rev": [4104, 4157, 4657, 4217, 4883, 5105, 5800, 5145, 5700, 6050],
-              "m":   [16.0, 16.4, 17.2, 16.9, 17.1, 17.4, 18.3, 17.6, 17.0, 17.8], "de": [0.35, 0.30, 0.26, 0.22, 0.18], "conv": 0.98,
-              "dd": [3, 3, 3, 2, 2], "inv": [70, 68, 66, 64, 63]},
+              "margin": [16.0, 16.4, 17.2, 16.9, 17.1, 17.4, 18.3, 17.6, 17.0, 17.8],
+              "de": [0.35, 0.31, 0.27, 0.22, 0.18], "cfo_pat": 0.98, "debtor": [2, 2, 2, 2, 2],
+              "inventory": [74, 72, 70, 69, 67], "payable": [40, 41, 40, 42, 41]},
 }
 
-SEASON = {6: 0.96, 9: 1.0, 12: 1.06, 3: 0.98}
+PRICE_BASE = {"RELIANCE": 1480, "HDFCBANK": 1010, "ICICIBANK": 1395, "SBIN": 905, "INFY": 1540, "TCS": 3120,
+              "KPITTECH": 1290, "TMPV": 410, "MARUTI": 15800, "M&M": 3550, "LT": 3920, "ITC": 418, "HINDUNILVR": 2480,
+              "SUNPHARMA": 1710, "BHARTIARTL": 2050, "NTPC": 342, "TITAN": 3660, "ASIANPAINT": 2390, "DIXON": 16800,
+              "POLYCAB": 7450, "TRENT": 4720, "PERSISTENT": 6120, "HAL": 4810, "BAJFINANCE": 1035, "DMART": 4290}
+PLANTED = {"DIXON": (0, 6.8, 3.4), "SUNPHARMA": (0, -4.6, 2.3), "KPITTECH": (0, 3.1, 2.6), "POLYCAB": (1, 5.1, 2.1),
+           "ASIANPAINT": (6, -4.3, 1.9), "RELIANCE": (4, 1.2, 2.2), "LT": (0, 2.4, 1.6), "TITAN": (3, -1.8, 1.4)}
+
+ABOUT = {
+    "RELIANCE": "Conglomerate spanning oil-to-chemicals, retail and digital services.",
+    "HDFCBANK": "Private-sector bank with retail, wholesale and treasury businesses.",
+    "ICICIBANK": "Private-sector bank with retail and corporate lending.", "SBIN": "India's largest public-sector bank.",
+    "INFY": "IT services and consulting.", "TCS": "IT services, consulting and business solutions.",
+    "KPITTECH": "Automotive software and engineering services.", "TMPV": "Passenger and electric vehicles.",
+    "MARUTI": "Passenger cars.", "M&M": "Utility vehicles, tractors and farm equipment.",
+    "LT": "Engineering, procurement and construction.", "ITC": "Cigarettes, FMCG, hotels, paperboards and agri.",
+    "HINDUNILVR": "Home and personal care, foods.", "SUNPHARMA": "Specialty and generic pharmaceuticals.",
+    "BHARTIARTL": "Mobile, broadband and enterprise telecom services.", "NTPC": "Thermal and renewable power generation.",
+    "TITAN": "Jewellery, watches and eyecare retail.", "ASIANPAINT": "Decorative and industrial paints.",
+    "DIXON": "Electronics manufacturing services: mobiles, consumer electronics, appliances, lighting.",
+    "POLYCAB": "Wires, cables and fast-moving electrical goods.", "TRENT": "Fashion retail (Westside, Zudio).",
+    "PERSISTENT": "Software product engineering services.", "HAL": "Aircraft, helicopters and aero-engines for defence.",
+    "BAJFINANCE": "Consumer and SME lending NBFC.", "DMART": "Value-retail supermarket chain.",
+}
 
 
 def _rng(*key) -> random.Random:
-    return random.Random(int(hashlib.md5("|".join(map(str, key)).encode()).hexdigest()[:8], 16))
+    return random.Random(int(hashlib.sha256("|".join(map(str, key)).encode()).hexdigest()[:12], 16))
 
 
-def quarter_ends(last: date, n: int = 10) -> list[date]:
-    out = []
-    y, m = last.year, last.month
-    for _ in range(n):
-        out.append(date(y, m, calendar.monthrange(y, m)[1]))
-        m -= 3
-        if m <= 0:
-            m += 12
-            y -= 1
-    return list(reversed(out))
-
-
-def _qlabel(d: date) -> str:
-    return d.strftime("%b %Y")
-
-
-def _weekdays_back(end: date, n: int) -> list[date]:
-    out, d = [], end
-    while len(out) < n:
+def sessions() -> list[date]:
+    out, d = [], DEMO_TODAY - timedelta(days=1)
+    while len(out) < N_SESSIONS:
         if d.weekday() < 5:
             out.append(d)
         d -= timedelta(days=1)
-    return list(reversed(out))
+    return out[::-1]
 
 
-def last_session(today: date | None = None) -> date:
-    d = (today or date.today()) - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+def weekday_back(n: int) -> date:
+    return sessions()[-1 - n]
 
 
-def latest_reported_quarter(sess: date) -> date:
-    """Quarter whose results season we're in (results land ~2-7 weeks after quarter end)."""
-    y, m = sess.year, sess.month
-    qm = ((m - 1) // 3) * 3  # previous quarter-end month
-    if qm == 0:
-        qm, y = 12, y - 1
-    return date(y, qm, calendar.monthrange(y, qm)[1])
-
-
-# ------------------------------------------------------------------------------------ financials
-
-def _q_metrics(rev: float, margin: float | None, rng: random.Random, fin: bool, k: dict) -> dict:
-    """k = per-company cost structure, so quarters differ by operations, not random noise."""
-    j = lambda: rng.uniform(0.97, 1.03)  # noqa: E731
-    if fin:
-        pbt = rev * k["bank_pbt"] * j()
-        return {"revenue": round(rev, 1), "ebitda": None, "other_income": round(rev * 0.12, 1), "interest": round(rev * 0.48, 1),
-                "depreciation": round(rev * 0.012, 1), "pbt": round(pbt, 1), "tax_pct": 25.0, "pat": round(pbt * 0.75, 1), "exceptional": 0}
-    ebitda = rev * margin / 100
-    oi = rev * k["oi"] * j()
-    dep = ebitda * k["dep"] * j()
-    intr = ebitda * k["int"] * j()
-    pbt = ebitda + oi - dep - intr
-    tax = 25.2
-    return {"revenue": round(rev, 1), "expenses": round(rev - ebitda, 1), "ebitda": round(ebitda, 1), "other_income": round(oi, 1),
-            "interest": round(intr, 1), "depreciation": round(dep, 1), "pbt": round(pbt, 1), "tax_pct": tax,
-            "pat": round(pbt * (1 - tax / 100), 1), "exceptional": 0}
-
-
-def build_financials(ticker: str, fin: bool, qends: list[date]) -> tuple[list[dict], list[dict]]:
-    rng = _rng("fin", ticker)
-    k = {"oi": rng.uniform(0.002, 0.008), "dep": rng.uniform(0.12, 0.26), "int": rng.uniform(0.02, 0.10), "bank_pbt": rng.uniform(0.24, 0.30)}
+# ---------------------------------------------------------------- financials
+def _quarter_rows(ticker: str, is_fin: bool) -> list[dict]:
+    r = _rng("fin", ticker)
     if ticker in STORY:
-        st = STORY[ticker]
-        qs = [_q_metrics(r, m, rng, fin, k) for r, m in zip(st["rev"], st["m"])]
+        revs, margins = STORY[ticker]["rev"], STORY[ticker]["margin"]
     else:
-        R, g, m, *_ = PROFILE[ticker]
-        qs = []
-        for i, qe in enumerate(qends):
-            t = len(qends) - 1 - i
-            rev = R / ((1 + g) ** (t / 4)) * SEASON[qe.month] / SEASON[qends[-1].month] * (1 + rng.uniform(-0.025, 0.025))
-            mm = None if m is None else m + rng.uniform(-0.6, 0.6)
-            qs.append(_q_metrics(rev, mm, rng, fin, k))
-    quarters = [{"period_end": qe, "label": _qlabel(qe), "metrics": q} for qe, q in zip(qends, qs)]
-
-    # annual: the two most recent full FYs are sums of their quarters; earlier years back-extrapolated
-    fy_ends = [q for q in qends if q.month == 3]
-    annual = []
-    for fe in fy_ends:
-        four = [q for q in quarters if fe - timedelta(days=360) < q["period_end"] <= fe]
-        if len(four) == 4:
-            annual.append({"period_end": fe, "metrics": {k: round(sum((q["metrics"].get(k) or 0) for q in four), 1) if not fin or k != "ebitda" else None
-                                                        for k in ("revenue", "ebitda", "other_income", "interest", "depreciation", "pbt", "pat")}})
-    g_back = (annual[-1]["metrics"]["revenue"] / annual[0]["metrics"]["revenue"] - 1) if len(annual) >= 2 else PROFILE.get(ticker, (0, 0.1))[1]
-    g_back = max(0.04, min(0.35, g_back))
-    while len(annual) < 5:
-        first = annual[0]
-        f = 1 / (1 + g_back * rng.uniform(0.8, 1.2))
-        mfac = rng.uniform(0.94, 1.04)
-        annual.insert(0, {"period_end": date(first["period_end"].year - 1, 3, 31),
-                          "metrics": {k: (round(v * f * (mfac if k in ("ebitda", "pbt", "pat") else 1), 1) if v is not None else None) for k, v in first["metrics"].items()}})
-    # balance sheet, cash flow, working capital
-    st = STORY.get(ticker)
-    prof = PROFILE.get(ticker)
-    for i, a in enumerate(annual):
-        m = a["metrics"]
-        nw = m["pat"] * (rng.uniform(5.5, 7.5) if not fin else 6.5) * (1 + 0.08 * i)
-        de = st["de"][i] if st else (prof[3] if prof and prof[3] is not None else None)
-        conv = st["conv"] if st else (prof[4] if prof and prof[4] is not None else None)
-        m["net_worth"] = round(nw, 1)
-        m["borrowings"] = round(nw * de * rng.uniform(0.9, 1.1), 1) if de is not None else round(m["revenue"] * 6.5, 1)
-        if conv is not None:
-            m["cfo"] = round(m["pat"] * conv * rng.uniform(0.85, 1.15), 1)
-            m["cfi"] = round(-abs(m["cfo"]) * (1.6 if ticker == "TITAN" else rng.uniform(0.45, 0.85)), 1)
+        p = PROFILES[ticker]
+        rev0, g = p[0], p[1]
+        margin = p[2] if len(p) > 2 else None
+        revs, margins = [], []
+        for i, qe in enumerate(QUARTER_ENDS):
+            k = 9 - i
+            trend = rev0 / (1 + g) ** (k / 4)
+            noise = 1.0 if k == 0 else 1 + r.uniform(-0.025, 0.025)
+            revs.append(round(trend * SEASON[qe.month] / SEASON[9] * noise, 0))
+            margins.append(None if margin is None else margin + (0 if k == 0 else r.uniform(-0.6, 0.6)))
+    oi_r, dep_r, int_r = r.uniform(0.002, 0.008), r.uniform(0.12, 0.26), r.uniform(0.02, 0.10)
+    bank_pbt = r.uniform(0.24, 0.30)
+    rows = []
+    for i, qe in enumerate(QUARTER_ENDS):
+        rev = float(revs[i])
+        j = lambda: 1 + r.uniform(-0.03, 0.03)  # noqa: E731
+        if is_fin:
+            pbt = rev * bank_pbt * j()
+            m = {"revenue": rev, "ebitda": None, "other_income": None, "interest": None, "depreciation": None,
+                 "pbt": pbt, "expenses": rev - pbt}
         else:
-            m["cfo"] = round(m["pat"] * rng.uniform(-1.5, 2.5), 1)
-            m["cfi"] = round(-m["pat"] * rng.uniform(0.2, 0.6), 1)
-        if not fin:
-            dd = st["dd"][i] if st else (prof[5] + rng.uniform(-4, 4))
-            inv = st["inv"][i] if st else (prof[6] + rng.uniform(-6, 6))
-            pay = 45 + rng.uniform(-8, 8) if not st else (40 if ticker != "TITAN" else 20)
-            m.update({"debtor_days": round(dd), "inventory_days": round(inv), "payable_days": round(pay), "ccc": round(dd + inv - pay)})
-            ebit = m["pbt"] + m["interest"]
-            m["roce"] = round(ebit / (nw + m["borrowings"]) * 100, 1)
-        m["roe"] = round(m["pat"] / nw * 100, 1)
-        a["label"] = f"Mar {a['period_end'].year}"
-    return quarters, annual
+            ebitda = rev * margins[i] / 100
+            oi, dep, intr = rev * oi_r * j(), ebitda * dep_r * j(), ebitda * int_r * j()
+            pbt = ebitda + oi - dep - intr
+            m = {"revenue": rev, "ebitda": ebitda, "other_income": oi, "interest": intr, "depreciation": dep, "pbt": pbt,
+                 "expenses": rev - ebitda}
+        m["tax_pct"] = TAX * 100
+        m["pat"] = m["pbt"] * (1 - TAX)
+        m["exceptional"] = 0.0
+        m["eps"] = None
+        rows.append({k: (round(v, 2) if isinstance(v, float) else v) for k, v in m.items()})
+    return rows
 
 
-# ------------------------------------------------------------------------------------ prices
+def _annual_rows(ticker: str, q: list[dict], is_fin: bool) -> list[tuple[date, dict]]:
+    r = _rng("annual", ticker)
+    fys = []
+    for fe in (date(2025, 3, 31), date(2026, 3, 31)):
+        idx = [i for i, qe in enumerate(QUARTER_ENDS) if fe - timedelta(days=360) < qe <= fe]
+        if len(idx) == 4:
+            tot = {}
+            for k in ("revenue", "ebitda", "other_income", "interest", "depreciation", "pbt", "pat", "expenses",
+                      "exceptional"):
+                vals = [q[i][k] for i in idx]
+                tot[k] = None if any(v is None for v in vals) else round(sum(vals), 2)
+            fys.append((fe, tot))
+    g = (fys[-1][1]["revenue"] / fys[-2][1]["revenue"] - 1) if len(fys) == 2 else 0.1
+    g = max(min(g, 0.25), -0.05) if ticker not in STORY else g * 0.8
+    while len(fys) < 5:
+        fe0, t0 = fys[0]
+        prev = {k: (None if v is None else round(v / (1 + g) * (1 + r.uniform(-0.02, 0.02)), 2)) for k, v in t0.items()}
+        fys.insert(0, (date(fe0.year - 1, 3, 31), prev))
+    story = STORY.get(ticker)
+    p = PROFILES.get(ticker, ())
+    nw = fys[-1][1]["pat"] * r.uniform(5.5, 7.5)
+    out = []
+    for i, (fe, m) in enumerate(fys):
+        k = len(fys) - 1 - i
+        m = dict(m)
+        m["tax_pct"] = TAX * 100
+        m["eps"] = None
+        net_worth = nw / (1.08 ** k)
+        m["net_worth"] = round(net_worth, 2)
+        m["roe"] = round(m["pat"] / net_worth * 100, 1)
+        if is_fin:
+            m.update(borrowings=None, cfo=None, cfi=None, fcf=None, debtor_days=None, inventory_days=None,
+                     payable_days=None, ccc=None, roce=None)
+        else:
+            de = story["de"][i] if story else max(0.0, p[3] * (1 + r.uniform(-0.04, 0.04)))
+            conv = story["cfo_pat"] if story else p[4]
+            m["borrowings"] = round(net_worth * de, 2)
+            cfo = m["pat"] * conv * (1 + r.uniform(-0.15, 0.15))
+            cfi = -abs(cfo) * r.uniform(0.45, 0.85) * (story.get("cfi_mult", 1.0) if story else 1.0)
+            m["cfo"], m["cfi"] = round(cfo, 2), round(cfi, 2)
+            m["fcf"] = round(cfo + cfi, 2)
+            if story:
+                dd, inv, pay = story["debtor"][i], story["inventory"][i], story["payable"][i]
+            else:
+                dd = round(p[5] + r.uniform(-2, 2), 0)
+                inv = round(p[6] + r.uniform(-3, 3), 0) if p[6] else 0
+                pay = round(45 + r.uniform(-3, 3), 0)
+            m.update(debtor_days=dd, inventory_days=inv, payable_days=pay, ccc=dd + inv - pay)
+            m["roce"] = round((m["pbt"] + (m["interest"] or 0)) / (net_worth + m["borrowings"]) * 100, 1)
+        out.append((fe, m))
+    return out
 
-PLANTS: dict[str, dict[int, tuple[float, float]]] = {
-    # sessions-ago -> (return %, volume multiple)
-    "DIXON": {0: (6.8, 3.4)},
-    "SUNPHARMA": {0: (-4.6, 2.3)},
-    "KPITTECH": {0: (3.1, 2.6)},
-    "POLYCAB": {1: (5.1, 2.1)},
-    "ASIANPAINT": {6: (-4.3, 1.9)},
-    "RELIANCE": {4: (1.2, 2.2)},
-    "LT": {0: (2.4, 1.6)},
-    "TITAN": {3: (-1.8, 1.4)},
-}
-BASE_PX = {"RELIANCE": 1480, "HDFCBANK": 1010, "ICICIBANK": 1395, "SBIN": 905, "INFY": 1540, "TCS": 3120, "KPITTECH": 1290,
-           "TMPV": 410, "MARUTI": 15800, "M&M": 3550, "LT": 3920, "ITC": 418, "HINDUNILVR": 2480, "SUNPHARMA": 1710,
-           "BHARTIARTL": 2050, "NTPC": 342, "TITAN": 3660, "ASIANPAINT": 2390, "DIXON": 16800, "POLYCAB": 7450,
-           "TRENT": 4720, "PERSISTENT": 6120, "HAL": 4810, "BAJFINANCE": 1035, "DMART": 4290}
+
+# ---------------------------------------------------------------- prices
+PRICE_SALT = "px78"  # seed salt for the synthetic walks (chosen so the planted scenario reads as designed)
 
 
-def build_prices(ticker: str, sessions: list[date]) -> list[dict]:
-    rng = _rng("px", ticker)
-    n = len(sessions)
-    drift = rng.uniform(-0.0002, 0.0008)
-    vol = rng.uniform(0.010, 0.017)
-    px = [0.0] * n
-    rets = []
-    for i in range(n):
-        ago = n - 1 - i
-        plant = PLANTS.get(ticker, {}).get(ago)
-        r = plant[0] / 100 if plant else max(-0.032, min(0.032, rng.gauss(drift, vol)))
-        rets.append(r)
-    level = BASE_PX.get(ticker, 1000)
-    # walk backwards from today's level so the latest close is near BASE_PX
-    px[-1] = level
+def _prices(ticker: str) -> list[dict]:
+    r = _rng(PRICE_SALT, ticker)
+    days = sessions()
+    n = len(days)
+    vol = r.uniform(1.0, 1.7)
+    rets = [max(-3.2, min(3.2, r.gauss(0.03, vol))) for _ in range(n)]
+    base_v = 10 ** r.uniform(5.6, 7.0)
+    vols = [base_v * math.exp(max(-0.45, min(0.45, r.gauss(0, 0.22)))) for _ in range(n)]
+    plant = PLANTED.get(ticker)
+    if plant:
+        ago, ret, vm = plant
+        i = n - 1 - ago
+        rets[i] = ret
+        vols[i] = vm * (sum(vols[i - 20:i]) / 20)
+    closes = [0.0] * n
+    closes[-1] = PRICE_BASE[ticker]
     for i in range(n - 1, 0, -1):
-        px[i - 1] = px[i] / (1 + rets[i])
-    base_vol = rng.uniform(1.5e6, 9e6) * (1000 / max(level, 100)) ** 0.5
-    out = []
-    for i, d in enumerate(sessions):
-        ago = n - 1 - i
-        plant = PLANTS.get(ticker, {}).get(ago)
-        vm = plant[1] if plant else math.exp(max(-0.45, min(0.45, rng.gauss(0, 0.22))))
-        c = px[i]
-        o = px[i - 1] * (1 + rng.uniform(-0.004, 0.004)) if i else c
-        hi = max(o, c) * (1 + abs(rng.gauss(0, 0.004)))
-        lo = min(o, c) * (1 - abs(rng.gauss(0, 0.004)))
-        out.append({"date": d, "open": round(o, 2), "high": round(hi, 2), "low": round(lo, 2), "close": round(c, 2), "adj_close": round(c, 2), "volume": round(base_vol * vm)})
-    return out
+        closes[i - 1] = closes[i] / (1 + rets[i] / 100)
+    rows = []
+    for i, d in enumerate(days):
+        c = closes[i]
+        o = (closes[i - 1] if i else c) * (1 + r.uniform(-0.004, 0.004))
+        hi = max(o, c) * (1 + r.uniform(0, 0.006))
+        lo = min(o, c) * (1 - r.uniform(0, 0.006))
+        rows.append({"ticker": ticker, "date": d, "open": round(o, 2), "high": round(hi, 2), "low": round(lo, 2),
+                     "close": round(c, 2), "adj_close": round(c, 2), "volume": float(round(vols[i])), "source": "demo"})
+    return rows
 
 
-# ------------------------------------------------------------------------------------ filings
-
-def _results_filing(name: str, qe: date, prev: date, ya: date, cur: dict, pr: dict, yy: dict) -> str:
-    f = lambda v: f"{v:,.2f}"  # noqa: E731
-    rows = [
-        ("1 Revenue from operations", "revenue"), ("2 Other income", "other_income"),
-    ]
-    lines = [BANNER, f"{name.upper()} LIMITED", f"Statement of Unaudited Consolidated Financial Results for the quarter ended {qe:%d %B %Y}",
-             "(Rs. in crore)", f"Particulars    Quarter ended {qe:%d.%m.%Y}    {prev:%d.%m.%Y}    {ya:%d.%m.%Y}",
-             "                (Unaudited)    (Unaudited)    (Unaudited)"]
-    for lbl, k in rows:
-        lines.append(f"{lbl}    {f(cur[k])}    {f(pr[k])}    {f(yy[k])}")
-    tot = lambda m: m["revenue"] + m["other_income"]  # noqa: E731
-    lines.append(f"3 Total income    {f(tot(cur))}    {f(tot(pr))}    {f(tot(yy))}")
-    lines.append("4 Expenses")
-    lines.append(f"  a) Cost of materials consumed and other operating expenses    {f(cur['expenses'])}    {f(pr['expenses'])}    {f(yy['expenses'])}")
-    lines.append(f"  b) Finance costs    {f(cur['interest'])}    {f(pr['interest'])}    {f(yy['interest'])}")
-    lines.append(f"  c) Depreciation and amortisation expense    {f(cur['depreciation'])}    {f(pr['depreciation'])}    {f(yy['depreciation'])}")
-    te = lambda m: m["expenses"] + m["interest"] + m["depreciation"]  # noqa: E731
-    lines.append(f"  Total expenses    {f(te(cur))}    {f(te(pr))}    {f(te(yy))}")
-    lines.append(f"5 Profit before exceptional items and tax    {f(cur['pbt'])}    {f(pr['pbt'])}    {f(yy['pbt'])}")
-    lines.append(f"6 Exceptional items    0.00    0.00    0.00")
-    lines.append(f"7 Profit before tax    {f(cur['pbt'])}    {f(pr['pbt'])}    {f(yy['pbt'])}")
-    tx = lambda m: m["pbt"] - m["pat"]  # noqa: E731
-    lines.append(f"8 Tax expense    {f(tx(cur))}    {f(tx(pr))}    {f(tx(yy))}")
-    lines.append(f"9 Net profit for the period    {f(cur['pat'])}    {f(pr['pat'])}    {f(yy['pat'])}")
-    return "Outcome of Board Meeting - approval of unaudited financial results.\f" + "\n".join(lines)
+# ---------------------------------------------------------------- results filing text
+def _f2(x: float) -> str:
+    neg = x < 0
+    whole, frac = f"{abs(x):.2f}".split(".")
+    s = f"{indian_group(int(whole))}.{frac}"
+    return f"({s})" if neg else s
 
 
-def build_announcements(sess: date, fins: dict, prev_session: date) -> list[dict]:
-    d0, d1 = sess, prev_session
-    d = lambda day, hh, mm: datetime.combine(day, time(hh, mm))  # noqa: E731
-    days = _weekdays_back(sess, 8)
-    qe = latest_reported_quarter(sess)
+def results_attachment(company: str, q: list[dict], idx: int) -> str:
+    cur, prev, ya = q[idx], q[idx - 1], q[idx - 4]
+    qe = QUARTER_ENDS[idx]
+    p1 = (f"Outcome of Board Meeting\n\n{company}\n\nThe Board of Directors at its meeting held today approved the "
+          f"unaudited consolidated and standalone financial results for the quarter ended {qe:%d %B %Y}. The results "
+          f"and the limited review report of the statutory auditors are enclosed.\n\n{WATERMARK}")
 
-    def res(t):
-        qs = fins[t][0]
-        cur, pr = qs[-1], qs[-2]
-        ya = next(q for q in qs if q["period_end"].year == cur["period_end"].year - 1 and q["period_end"].month == cur["period_end"].month)
-        name = dict((x[0], x[1]) for x in ALL)[t]
-        return _results_filing(name, cur["period_end"], pr["period_end"], ya["period_end"], cur["metrics"], pr["metrics"], ya["metrics"])
+    def row(no, label, key=None, vals=None):
+        vs = vals or [m[key] for m in (cur, prev, ya)]
+        return f"{no} {label} " + " ".join(_f2(v) for v in vs)
 
-    A = [
-        # --- the last 24 hours
-        ("DIXON", d(d0, 12, 40), "Outcome of Board Meeting", f"Outcome of Board Meeting - Unaudited Financial Results for the quarter ended {qe:%d %B %Y}", res("DIXON")),
-        ("TITAN", d(d0, 16, 20), "Financial Result Updates", f"Unaudited consolidated financial results for the quarter ended {qe:%d %B %Y}", res("TITAN")),
-        ("SUNPHARMA", d(d0, 8, 15), "Change in Directors/ Key Managerial Personnel/ Auditor/ Compliance Officer/ Share Transfer Agent",
-         "Resignation of Chief Financial Officer and appointment of new Chief Financial Officer",
-         "Pursuant to Regulation 30 of SEBI (LODR) Regulations, 2015, we inform that Mr. Kunal Mehrotra has tendered his resignation as Chief Financial Officer "
-         "of the Company to pursue opportunities outside the Company, with effect from close of business hours on 30 November 2026. "
-         "The Board of Directors, on the recommendation of the Nomination and Remuneration Committee, has appointed Ms. Ritika Sharan as Chief Financial Officer "
-         "and Key Managerial Personnel with effect from 1 December 2026.\n\nBrief profile of Ms. Ritika Sharan:\nMs. Ritika Sharan is a Chartered Accountant with 22 years of experience in "
-         "finance, treasury and investor relations. She was most recently Chief Financial Officer of the India business of a multinational generics company, and earlier spent "
-         "eleven years in corporate finance roles at a large Indian IT services firm. She holds a bachelor's degree in commerce from the University of Delhi.\n\n"
-         "Disclosure of relationships between directors: Ms. Ritika Sharan is not related to any Director of the Company. (Names are fictional - illustrative demo.)"),
-        ("KPITTECH", d(d0, 9, 5), "Acquisition", "Acquisition of 100% stake in an automotive software engineering company in Germany",
-         "The Company has entered into a definitive agreement to acquire 100% of the share capital of an automotive middleware engineering company headquartered in Munich, "
-         "Germany, for a total consideration of up to Rs. 950 crore, payable in cash in two tranches. The target reported revenue of EUR 96 million in CY2025 and employs about 800 engineers. "
-         "The acquisition is expected to be completed by 31 March 2027, subject to regulatory approvals."),
-        ("LT", d(d0, 10, 15), "Press Release", "L&T bags 'significant' order for a metro rail project",
-         "The Heavy Civil Infrastructure business of the Company has secured a significant order (Rs. 2,500 crore to Rs. 5,000 crore as per the Company's classification) "
-         "for design and construction of an elevated metro corridor including 14 stations."),
-        ("POLYCAB", d(d1, 14, 30), "Updates", "Board approves capex of Rs. 1,200 crore for capacity expansion of wires and cables",
-         "The Board approved capital expenditure of Rs. 1,200 crore over FY27-FY28 for brownfield capacity expansion of the wires and cables business at Halol, funded through internal accruals."),
-        ("ICICIBANK", d(d0, 11, 0), "Credit Rating", "Credit rating reaffirmed by CRISIL",
-         "CRISIL has reaffirmed its rating of CRISIL AAA/Stable on the Bank's long-term debt programme and CRISIL A1+ on certificates of deposit."),
-        ("ASIANPAINT", d(d0, 13, 45), "Updates", "Receipt of GST demand order",
-         "The Company has received an order from the GST authorities raising a demand of Rs. 118.6 crore including interest and penalty, relating to input tax credit for FY2020-21. "
-         "The Company believes it has a strong case on merits and intends to file an appeal. No material impact on financial or other operations is expected."),
-        ("TCS", d(d0, 15, 5), "Analysts/Institutional Investor Meet/Con. Call Updates", "Schedule of analyst / institutional investor meetings", "Schedule of meetings with investors during the week."),
-        ("TCS", d(d0, 15, 9), "Analysts/Institutional Investor Meet/Con. Call Updates", "Schedule of analyst / institutional investor meetings", "Schedule of meetings with investors during the week."),
-        ("M&M", d(d0, 17, 30), "Board Meeting Intimation", f"Intimation of Board Meeting to consider and approve financial results for the quarter ended {qe:%d %B %Y}", None),
-        ("BHARTIARTL", d(d0, 18, 0), "Updates", "Allotment of non-convertible debentures aggregating Rs. 2,000 crore on private placement basis",
-         "The Company has allotted 20,000 listed, rated, unsecured, redeemable non-convertible debentures of face value Rs. 10 lakh each aggregating Rs. 2,000 crore."),
-        ("ITC", d(d0, 18, 20), "Record Date", "Record date for interim dividend", "Interim dividend of Rs. 7.00 per share; record date fixed as the coming Friday."),
-        ("HDFCBANK", d(d0, 18, 40), "ESOP/ESOS/ESPS", "Allotment of equity shares under ESOS", "Allotment of 4,12,300 equity shares pursuant to exercise of stock options."),
-        ("INFY", d(d0, 18, 45), "Certificate under SEBI (Depositories and Participants) Regulations, 2018", "Compliance certificate under Regulation 74(5)", None),
-        ("RELIANCE", d(d0, 19, 0), "Copy of Newspaper Publication", "Copy of newspaper publication of financial results", None),
-        ("MARUTI", d(d0, 19, 10), "Trading Window", "Closure of trading window", None),
-        ("NTPC", d(d0, 19, 15), "Updates", "Declaration of commercial operation of 660 MW Unit-2 of a supercritical thermal project",
-         "Unit-2 (660 MW) has been declared on commercial operation, taking the group's installed capacity to 82,410 MW."),
-        ("TMPV", d(d0, 19, 30), "Analysts/Institutional Investor Meet/Con. Call Updates", "Transcript of the earnings conference call", "Transcript of the earnings call held for the quarter is attached."),
-        # --- earlier in the week
-        ("ICICIBANK", d(days[-3], 16, 45), "Financial Result Updates", f"Unaudited standalone financial results for the quarter ended {qe:%d %B %Y}", None),
-        ("SBIN", d(days[-3], 14, 0), "Updates", "Board approves raising of up to Rs. 20,000 crore through Basel III compliant bonds", "Raising of funds via Basel III compliant AT1 and Tier 2 bonds in FY27."),
-        ("HINDUNILVR", d(days[-4], 12, 0), "Press Release", "Launch of new premium skincare range", "New premium skincare range launched across e-commerce and modern trade."),
-        ("TITAN", d(days[-4], 17, 0), "Board Meeting Intimation", f"Intimation of Board Meeting to consider financial results for the quarter ended {qe:%d %B %Y}", None),
-        ("RELIANCE", d(days[-5], 15, 30), "Analysts/Institutional Investor Meet/Con. Call Updates", "Intimation of participation in an investor conference", None),
-        ("SUNPHARMA", d(days[-5], 12, 10), "Updates", "USFDA inspection of a formulation facility concluded with three observations (Form 483)",
-         "The USFDA conducted an inspection at one of the Company's formulation facilities and issued a Form 483 with three observations. The Company will respond within 15 business days."),
-        ("DIXON", d(days[-6], 18, 0), "Board Meeting Intimation", f"Intimation of Board Meeting to consider results for the quarter ended {qe:%d %B %Y}", None),
-        ("M&M", d(days[-6], 10, 0), "Press Release", "Monthly auto sales: total vehicle sales up 17% YoY", "Total vehicle sales of 92,400 units, up 17% year-on-year."),
-        ("ASIANPAINT", d(days[-7], 11, 30), "Shareholders meeting", "Notice of postal ballot", None),
-        ("ITC", d(days[-7], 16, 0), "Insider Trading", "Disclosure under Regulation 7(2) of SEBI (Prohibition of Insider Trading) Regulations", "Sale of 12,000 shares by a designated person."),
-    ]
-    out = []
-    for t, when, excat, subject, text in A:
-        out.append({"ticker": t, "published_at": when, "subject": subject, "exchange_category": excat, "attachment_text": text,
-                    "body": None, "attachment_url": None, "source": "demo",
-                    "dedupe_key": hashlib.sha256(f"demo|{t}|{subject}|{when:%Y%m%d%H%M}".encode()).hexdigest()})
-    return out
+    exp_total = [m["revenue"] + m["other_income"] - (m["pbt"]) for m in (cur, prev, ya)]
+    other_exp = [exp_total[i] - m["interest"] - m["depreciation"] for i, m in enumerate((cur, prev, ya))]
+    tax = [m["pbt"] - m["pat"] for m in (cur, prev, ya)]
+    p2 = "\n".join([
+        f"{company}",
+        f"Statement of Unaudited Consolidated Financial Results for the quarter ended {qe:%d %B %Y}",
+        "(Rs. in crore)",
+        f"Particulars | Quarter ended {qe:%d.%m.%Y} | Preceding quarter | Corresponding quarter of previous year",
+        row("1", "Revenue from operations", "revenue"),
+        row("2", "Other income", "other_income"),
+        row("3", "Total income", vals=[m["revenue"] + m["other_income"] for m in (cur, prev, ya)]),
+        "4 Expenses",
+        row("a)", "Cost of materials and other expenses", vals=other_exp),
+        row("b)", "Finance costs", "interest"),
+        row("c)", "Depreciation and amortisation expense", "depreciation"),
+        row("", "Total expenses", vals=exp_total),
+        row("5", "Profit before exceptional items and tax", "pbt"),
+        row("6", "Exceptional items", vals=[0.0, 0.0, 0.0]),
+        row("7", "Profit before tax", "pbt"),
+        row("8", "Tax expense", vals=tax),
+        row("9", "Net profit for the period", "pat"),
+        WATERMARK,
+    ])
+    return p1 + "\f" + p2
 
 
-# ------------------------------------------------------------------------------------ documents
-
-TX = {
-    "DIXON": {
-        "industry": "electronics manufacturing services (EMS)",
-        "segments": "mobile phones and EMS, consumer electronics (LED TVs), home appliances (washing machines), lighting, and security systems",
-        "mix": "mobile and EMS 72%, consumer electronics 16%, home appliances 7%, lighting and others 5%",
-        "calls": {
-            "Q3 FY26": [
-                ("Managing Director", "For FY26 we expect revenue growth of 30% to 35%, led by mobile phones where our new customer programmes ramp up through the fourth quarter."),
-                ("Chief Financial Officer", "We expect EBITDA margin for FY26 in the range of 3.9% to 4.1% as the mix shifts towards mobiles, which carry lower margins but very high return on capital."),
-                ("Analyst A", "Could you talk about the component ecosystem and backward integration?"),
-                ("Managing Director", "We are investing in display module and camera module capacity. Capex for FY26 will be about Rs. 1,000 crore, largely in mobile and display."),
-            ],
-            "Q4 FY26": [
-                ("Managing Director", "FY26 was an exceptional year; revenue grew about 38% and every segment contributed. Looking ahead, for FY27 we are guiding revenue growth of 30% to 35%."),
-                ("Chief Financial Officer", "For Q1 FY27 we expect EBITDA margin of 4.0% to 4.2% as display module volumes begin to contribute."),
-                ("Analyst B", "Is there any risk from customer concentration in mobiles?"),
-                ("Managing Director", "Concentration is a risk we monitor closely; we are adding two new brand customers this year to diversify the order book."),
-            ],
-            "Q1 FY27": [
-                ("Managing Director", "Q1 margins came in below our expectation because the display module line took longer to stabilise. We are raising our FY27 guidance and now expect revenue growth of 35% to 40% for FY27."),
-                ("Chief Financial Officer", "For the next quarter we expect revenue growth of at least 30% year-on-year, with the festive season build for televisions and phones."),
-                ("Chief Financial Officer", "We expect FY27 EBITDA margin of 3.8% to 4.0%, slightly lower than earlier because of the display start-up costs."),
-                ("Analyst A", "What is the working-capital outlook?"),
-                ("Chief Financial Officer", "Working-capital days should stay negative to flat; our customers fund a large part of inventory under the EMS model."),
-            ],
-            "Q2 FY27": [
-                ("Managing Director", "Q2 revenue grew 38% year-on-year, our highest quarterly revenue so far. We maintain the FY27 guidance of revenue growth of 35% to 40%."),
-                ("Chief Financial Officer", "Over the medium term we aspire to an EBITDA margin of 4.5% as components scale up, but that is a multi-year journey."),
-                ("Analyst B", "Any update on the production-linked incentive scheme?"),
-                ("Managing Director", "PLI accruals are in line with plan and are recognised as other operating income."),
-            ],
-        },
-    },
-    "TITAN": {
-        "industry": "jewellery, watches and wearables, and eyecare retail",
-        "segments": "jewellery (Tanishq and other brands), watches and wearables, eyecare, and emerging businesses including fragrances and Indian dress wear",
-        "mix": "jewellery 88%, watches and wearables 7%, eyecare 2%, emerging businesses and others 3%",
-        "calls": {
-            "Q3 FY26": [
-                ("Managing Director", "The festive quarter was strong. We expect to close FY26 with revenue growth of around 20%, supported by wedding demand and new store additions."),
-                ("Chief Financial Officer", "We expect EBITDA margin for FY26 to be in the 11% to 11.5% band despite gold price volatility."),
-                ("Analyst A", "How are you managing gold price volatility?"),
-                ("Chief Financial Officer", "We continue to use gold metal loans to hedge inventory; these are reflected in borrowings and will rise with inventory."),
-            ],
-            "Q4 FY26": [
-                ("Managing Director", "FY26 revenue grew about 16%, below the 20% we had indicated, as high gold prices dampened buying in the last quarter. For FY27 we are guiding revenue growth of 18% to 20%."),
-                ("Chief Financial Officer", "For Q1 FY27 we expect revenue growth of 14% to 16% given a high base and fewer wedding dates."),
-                ("Chief Financial Officer", "We are targeting FY27 EBITDA margin of 11% to 11.5%."),
-                ("Analyst B", "Inventory days have gone up. Is that a concern?"),
-                ("Chief Financial Officer", "Inventory went up because of store additions and higher gold prices; we expect it to normalise over the next two to three quarters."),
-            ],
-            "Q1 FY27": [
-                ("Managing Director", "Q1 was softer than planned. Given gold price trends we now expect FY27 revenue growth of 15% to 17%, lower than our earlier guidance."),
-                ("Chief Financial Officer", "We maintain the FY27 EBITDA margin guidance of 11% to 11.5%, though Q2 will be seasonally weaker."),
-                ("Analyst A", "What is the store addition plan?"),
-                ("Managing Director", "We plan to add around 60 jewellery stores this year, mostly in smaller towns."),
-            ],
-            "Q2 FY27": [
-                ("Managing Director", "Q2 revenue grew about 9% year-on-year. Studded jewellery remained weak while gold coins grew."),
-                ("Chief Financial Officer", "Margins were impacted by higher promotional spend; we expect the second half to show double-digit revenue growth with margins recovering."),
-                ("Analyst B", "Do you still stand by the margin guidance?"),
-                ("Chief Financial Officer", "We will review the margin guidance after the festive quarter; it is too early to change it."),
-            ],
-        },
-    },
-    "TRENT": {
-        "industry": "apparel and lifestyle retail",
-        "segments": "Westside (lifestyle), Zudio (value fashion), Star (food and grocery, joint venture) and other formats",
-        "mix": "Zudio 58%, Westside 37%, others 5% (standalone)",
-        "calls": {
-            "Q3 FY26": [
-                ("Managing Director", "We expect FY26 revenue growth of upwards of 25% as Zudio store additions continue at a fast pace."),
-                ("Chief Financial Officer", "We expect FY26 EBITDA margin of 16% to 17% on a pre-Ind AS 116 basis."),
-                ("Analyst A", "How many stores will you add?"),
-                ("Managing Director", "We plan to add about 200 Zudio stores in FY26 and enter two new international markets."),
-            ],
-            "Q4 FY26": [
-                ("Managing Director", "FY26 revenue grew about 22%. Like-for-like growth moderated in the second half. For FY27 we expect revenue growth of around 20%."),
-                ("Chief Financial Officer", "For Q1 FY27 we expect revenue growth of at least 15% year-on-year."),
-                ("Analyst B", "Any change to capex plans?"),
-                ("Chief Financial Officer", "Capex for FY27 will be about Rs. 1,500 crore, funded through internal accruals."),
-            ],
-            "Q1 FY27": [
-                ("Managing Director", "Q1 revenue grew about 17% year-on-year. We maintain our FY27 guidance of revenue growth of around 20%."),
-                ("Chief Financial Officer", "We expect FY27 EBITDA margin of 17% to 18%."),
-                ("Analyst A", "How is competition from quick-commerce fashion?"),
-                ("Managing Director", "We see it as additive to category growth; our stores remain the primary channel."),
-            ],
-            "Q2 FY27": [
-                ("Managing Director", "Q2 revenue grew about 18.5% year-on-year with Zudio crossing 900 stores."),
-                ("Chief Financial Officer", "We expect the next quarter to deliver revenue growth of 18% to 20% with the festive season."),
-                ("Analyst B", "Will margins sustain?"),
-                ("Chief Financial Officer", "We are confident of sustaining margins in the 17% to 18% range over the medium term."),
-            ],
-        },
-    },
-}
+# ---------------------------------------------------------------- announcements
+def _at(n: int, hh: int, mm: int) -> datetime:
+    return datetime.combine(weekday_back(n), time(hh, mm))
 
 
-def _write_pdf(path: Path, title: str, sections: list[tuple[str | None, list[str]]]) -> None:
-    import fitz
+def announcements(fin: dict[str, list[dict]]) -> list[dict]:
+    rev = lambda t, i=9: fin[t][i]["revenue"]  # noqa: E731,F841
+    A = []
 
-    doc = fitz.open()
-    page, y = None, 0.0
-    W, H, M = 595, 842, 48
+    def add(n, hh, mm, t, label, subject, body="", attachment=None):
+        A.append({"ticker": t, "published_at": _at(n, hh, mm), "exchange_category": label, "subject": subject,
+                  "body": body or subject, "attachment_text": attachment,
+                  "attachment_url": None, "source": "demo"})
+
+    add(0, 12, 40, "DIXON", "Outcome of Board Meeting",
+        "Outcome of Board Meeting - Unaudited financial results for the quarter ended 30 September 2026",
+        "The Board approved the unaudited consolidated financial results for the quarter ended 30 September 2026.",
+        results_attachment("Dixon Technologies (India) Ltd", fin["DIXON"], 9))
+    add(0, 16, 20, "TITAN", "Financial Result Updates",
+        "Unaudited financial results for the quarter ended 30 September 2026",
+        "Unaudited consolidated financial results for the quarter ended 30 September 2026 are enclosed.",
+        results_attachment("Titan Company Ltd", fin["TITAN"], 9))
+    add(0, 8, 15, "SUNPHARMA", "Change in Directors/Key Managerial Personnel/Auditor/Compliance Officer/Share Transfer Agent",
+        "Change in Key Managerial Personnel - resignation of Chief Financial Officer and appointment of new CFO",
+        "Pursuant to Regulation 30 of the SEBI (LODR) Regulations, 2015, we inform you that Mr. Kunal Mehrotra has "
+        "tendered his resignation as Chief Financial Officer of the Company to pursue opportunities outside the Company, "
+        "w.e.f. close of business hours on 30 November 2026. The Board of Directors, on the recommendation of the "
+        "Nomination and Remuneration Committee, has approved the appointment of Ms. Ritika Sharan as Chief Financial "
+        "Officer and Key Managerial Personnel of the Company w.e.f. 1 December 2026.\n\n"
+        "Brief profile of Ms. Ritika Sharan: Ms. Sharan is a Chartered Accountant with 22 years of experience in finance, "
+        "treasury and investor relations. She was previously CFO of the India business of a multinational generics "
+        "company, and before that spent 11 years at a large Indian IT services firm. She holds a B.Com degree from "
+        "Delhi University.\n\n(Names are fictional - illustrative demo.)")
+    add(0, 9, 5, "KPITTECH", "Acquisition",
+        "Acquisition of 100% stake in a Munich-based automotive middleware company",
+        "KPIT Technologies Ltd has signed a definitive agreement to acquire 100% of a Munich-based automotive middleware "
+        "company for a total consideration of up to Rs. 950 crore in cash, payable in two tranches. The target reported "
+        "revenue of EUR 96 million in CY2025 and has about 800 engineers.")
+    add(0, 10, 15, "LT", "Press Release",
+        "L&T secures 'significant' order for an elevated metro rail project",
+        "Larsen & Toubro's Heavy Civil Infrastructure business has secured a 'significant' order (Rs. 2,500 crore to "
+        "Rs. 5,000 crore as per L&T's classification) to build an elevated metro corridor with 14 stations.")
+    add(1, 14, 30, "POLYCAB", "Updates",
+        "Board approves capex of Rs. 1,200 crore for brownfield capacity expansion at Halol",
+        "The Board approved capital expenditure of Rs. 1,200 crore over FY27-FY28 for brownfield capacity expansion of "
+        "the wires and cables plant at Halol, to be funded through internal accruals.")
+    add(0, 11, 0, "ICICIBANK", "Credit Rating",
+        "CRISIL reaffirms AAA/Stable rating on long-term debt instruments",
+        "CRISIL Ratings has reaffirmed its AAA/Stable rating on the Bank's long-term debt instruments.")
+    add(0, 13, 45, "ASIANPAINT", "Updates",
+        "Receipt of GST demand order of Rs. 118.6 crore",
+        "The Company has received a GST demand order of Rs. 118.6 crore including interest and penalty. The Company "
+        "believes it has a strong case on merits and will file an appeal.")
+    add(0, 15, 5, "TCS", "Analysts/Institutional Investor Meet/Con. Call Updates",
+        "Schedule of analyst / institutional investor meetings",
+        "Schedule of analyst / institutional investor meetings to be held during the week.")
+    add(0, 15, 9, "TCS", "Analysts/Institutional Investor Meet/Con. Call Updates",
+        "Schedule of analyst / institutional investor meetings",
+        "Schedule of analyst / institutional investor meetings to be held during the week.")
+    add(0, 17, 30, "M&M", "Board Meeting Intimation",
+        "Intimation of Board Meeting to consider and approve the unaudited financial results for the quarter ended "
+        "30 September 2026")
+    add(0, 18, 0, "BHARTIARTL", "Updates",
+        "Allotment of Non-Convertible Debentures aggregating Rs. 2,000 crore",
+        "The Company has allotted listed, unsecured, rated non-convertible debentures aggregating Rs. 2,000 crore on a "
+        "private placement basis.")
+    add(0, 18, 20, "ITC", "Record Date", "Record date for interim dividend of Rs. 7 per share",
+        "The Board has fixed the record date for the interim dividend of Rs. 7 per ordinary share.")
+    add(0, 18, 40, "HDFCBANK", "ESOP/ESOS/ESPS", "Allotment of equity shares under ESOS")
+    add(0, 18, 45, "INFY", "Certificate under SEBI (Depositories and Participants) Regulations, 2018",
+        "Certificate under Regulation 74(5) of SEBI (DP) Regulations, 2018")
+    add(0, 19, 0, "RELIANCE", "Copy of Newspaper Publication", "Copy of newspaper publication")
+    add(0, 19, 10, "MARUTI", "Trading Window", "Closure of trading window")
+    add(0, 19, 15, "NTPC", "Updates",
+        "Declaration of commercial operation of 660 MW Unit-2",
+        "Unit-2 (660 MW) of the station has been declared on commercial operation from 00:00 hours today.")
+    add(0, 19, 30, "TMPV", "Analysts/Institutional Investor Meet/Con. Call Updates",
+        "Transcript of the earnings conference call for Q2 FY27",
+        "Transcript of the earnings conference call held to discuss the results for the quarter ended 30 September 2026.")
+    add(3, 16, 45, "ICICIBANK", "Financial Result Updates",
+        "Standalone unaudited financial results for the quarter ended 30 September 2026",
+        "Standalone unaudited financial results for the quarter ended 30 September 2026.")
+    add(3, 14, 0, "SBIN", "Updates", "Raising of funds through Basel III compliant bonds of up to Rs. 20,000 crore",
+        "The Board approved raising of funds through Basel III compliant AT1 and Tier 2 bonds of up to Rs. 20,000 crore.")
+    add(4, 12, 0, "HINDUNILVR", "Press Release", "Press release - launch of a premium skincare range",
+        "Hindustan Unilever announced the launch of a premium skincare range across modern trade and e-commerce.")
+    add(4, 17, 0, "TITAN", "Board Meeting Intimation",
+        "Intimation of Board Meeting to consider financial results for the quarter ended 30 September 2026")
+    add(5, 15, 30, "RELIANCE", "Analysts/Institutional Investor Meet/Con. Call Updates",
+        "Intimation of participation in an investor conference")
+    add(5, 12, 10, "SUNPHARMA", "Updates",
+        "USFDA inspection at the Halol facility concludes with Form 483 with 3 observations",
+        "The USFDA conducted an inspection at the Company's Halol facility, which concluded with a Form 483 with "
+        "3 observations. The Company will respond within the stipulated time.")
+    add(6, 18, 0, "DIXON", "Board Meeting Intimation",
+        "Intimation of Board Meeting to consider and approve financial results for the quarter ended 30 September 2026")
+    add(6, 10, 0, "M&M", "Press Release", "Press release - October 2026 total auto sales up 17% year-on-year")
+    add(7, 11, 30, "ASIANPAINT", "Shareholders meeting", "Postal ballot notice",
+        "Notice of postal ballot seeking shareholder approval for re-appointment of an independent director.")
+    add(7, 16, 0, "ITC", "Insider Trading - SAST",
+        "Disclosure under Regulation 7(2) of SEBI (PIT) Regulations - sale of shares by a designated person")
+    for a in A:
+        a["dedupe_key"] = hashlib.sha256(f"demo|{a['ticker']}|{a['subject']}|{a['published_at']}".encode()).hexdigest()
+    return A
+
+
+# ---------------------------------------------------------------- PDFs
+def write_pdf(path: Path, title: str, sections: list[tuple[str, list[str]]]) -> int:
+    """A4, Helvetica; watermark + title header on every page; each paragraph a separate textbox."""
+    import pymupdf
+    doc = pymupdf.open()
+    W, H, M = 595, 842, 50
+    width_chars = 92
+    page = None
+    y = 0.0
 
     def new_page():
         nonlocal page, y
         page = doc.new_page(width=W, height=H)
-        page.insert_text((M, 28), BANNER, fontsize=7, color=(0.7, 0.1, 0.1))
-        page.insert_text((M, 40), title, fontsize=7, color=(0.4, 0.4, 0.4))
-        y = 60
+        page.insert_text((M, 28), WATERMARK, fontsize=6.5, fontname="helv", color=(0.75, 0.2, 0.2))
+        page.insert_text((M, 40), title, fontsize=7.5, fontname="helv", color=(0.4, 0.4, 0.4))
+        y = 64
 
-    def put(text, size=9.5, bold=False):
+    def box(text, size=10.0, bold=False, gap=10.0):
         nonlocal y
-        for _ in range(2):
-            rect = fitz.Rect(M, y, W - M, H - M)
-            rc = page.insert_textbox(rect, text, fontsize=size, fontname="hebo" if bold else "helv")
-            if rc >= 0:
-                y += (rect.height - rc) + 8
-                return
+        fn = "hebo" if bold else "helv"
+        lines = textwrap.wrap(text, width=width_chars if size <= 10 else int(width_chars * 10 / size)) or [""]
+        h = len(lines) * size * 1.25 + 4
+        if page is None or y + h > H - 60:
             new_page()
+        # insert_textbox writes nothing when the text overflows, so grow the box until it fits
+        while True:
+            shape = page.new_shape()
+            rc = shape.insert_textbox(pymupdf.Rect(M, y, W - M, y + h), text, fontsize=size, fontname=fn)
+            if rc >= 0:
+                shape.commit()
+                h -= rc
+                break
+            h += size * 1.25
+        y += h + gap
 
-    new_page()
-    for head, paras in sections:
-        if head == "__PAGE__":
+    for heading, pars in sections:
+        if heading == "<pagebreak>":
             new_page()
             continue
-        if head:
-            put(head, 12, True)
-        for p in paras:
-            put(p)
-    doc.save(path)
+        if heading:
+            box(heading, size=12.5, bold=True, gap=6)
+        for p in pars:
+            box(p)
+    total = len(doc)
+    for i, pg in enumerate(doc, 1):
+        pg.insert_text((W / 2 - 20, H - 28), f"Page {i} of {total}", fontsize=7, fontname="helv", color=(0.5, 0.5, 0.5))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
     doc.close()
+    return total
 
 
-def _ar_sections(t: str, name: str, ann: list[dict]) -> list[tuple[str | None, list[str]]]:
-    info = TX[t]
-    a = ann[-1]["metrics"]
-    p = ann[-2]["metrics"]
-    g = (a["revenue"] / p["revenue"] - 1) * 100
-    em = a["ebitda"] / a["revenue"] * 100
-    cl = round(a["revenue"] * 0.011, 1)
-    rpt = round(a["revenue"] * 0.004, 1)
-    sec = [
-        (f"{name} - Annual Report FY26", ["Integrated Annual Report for the financial year ended 31 March 2026."]),
-        ("Business Overview", [
-            f"{name} operates in {info['industry']}. The Company's businesses comprise {info['segments']}.",
-            f"Revenue mix for FY26 by segment: {info['mix']}.",
-            "Our strategy is to grow market share through new customers and formats, deepen backward integration, and keep the balance sheet conservative.",
-        ]),
-        ("__PAGE__", []),
+def _cr(x: float) -> str:
+    return f"Rs. {indian_group(int(round(x)))} crore"
+
+
+AR_TEXT = {
+    "DIXON": {
+        "name": "Dixon Technologies (India) Ltd",
+        "industry": "Dixon is India's largest home-grown electronics manufacturing services (EMS) company. It designs and "
+                    "manufactures products for leading consumer-electronics and mobile brands, which sell them under "
+                    "their own names.",
+        "segments": "The Company operates four segments: mobile phones and EMS, consumer electronics (LED televisions), "
+                    "home appliances (washing machines) and lighting products.",
+        "mix": "In FY26 the revenue mix was mobile and EMS 72%, consumer electronics 16%, home appliances 7%, lighting and "
+               "others 5%.",
+        "outlook": "Management expects the production-linked incentive (PLI) scheme and new customer additions in mobile "
+                   "phones to support growth in FY27. The Company is investing in display modules and component "
+                   "manufacturing to deepen value addition.",
+        "risks": ["Customer concentration: the top five customers contribute a large share of revenue, and the loss of "
+                  "any one could affect volumes.",
+                  "Input and commodity volatility: component prices, especially memory and display panels, can move "
+                  "sharply and are passed through with a lag.",
+                  "Changes to government incentive schemes such as PLI could affect profitability.",
+                  "Competition from other EMS providers, domestic and global, could pressure margins.",
+                  "Foreign exchange: a large share of components is imported and priced in US dollars.",
+                  "Execution risk in scaling new plants and product lines on schedule."],
+        "emphasis": None,
+    },
+    "TITAN": {
+        "name": "Titan Company Ltd",
+        "industry": "Titan is a consumer lifestyle company with a retail network of branded stores across India.",
+        "segments": "The Company operates jewellery (Tanishq, Mia, Zoya), watches and wearables, eyecare, and emerging "
+                    "businesses including fragrances and Indian dress wear.",
+        "mix": "In FY26 the revenue mix was jewellery 88%, watches and wearables 7%, eyecare 2%, emerging businesses and "
+               "others 3%.",
+        "outlook": "Management expects store additions and wedding demand to support growth, while elevated gold prices "
+                   "may weigh on volumes in the near term.",
+        "risks": ["Gold-price volatility affects consumer demand and inventory valuation.",
+                  "Gold metal loans: a significant part of gold inventory is funded through gold metal loans, exposing "
+                  "the Company to gold-price and interest-rate movements.",
+                  "Input and commodity volatility in diamonds and other materials.",
+                  "Changes in import duties and government regulation on gold.",
+                  "Competition from national and regional jewellers and new entrants.",
+                  "Execution risk in the store expansion programme."],
+        "emphasis": "Emphasis of matter: We draw attention to the note on gold metal loans, which describes the "
+                    "accounting for gold taken on loan from banks. Our opinion is not modified in respect of this matter.",
+    },
+    "TRENT": {
+        "name": "Trent Ltd",
+        "industry": "Trent is a fashion and lifestyle retailer operating Westside, Zudio and other formats through "
+                    "company-owned stores.",
+        "segments": "The Company's formats are Zudio (value fashion), Westside (premium fashion and home) and others "
+                    "including Star grocery and international brands.",
+        "mix": "In FY26 the revenue mix was Zudio 58%, Westside 37%, others 5%.",
+        "outlook": "Management expects continued store additions in Zudio and Westside, with a focus on productivity per "
+                   "square foot.",
+        "risks": ["Customer concentration is low, but demand is sensitive to discretionary spending.",
+                  "Input and commodity volatility in cotton and other fabrics affects product costs.",
+                  "Changes in incentive schemes or GST rates on apparel could affect pricing.",
+                  "Competition from value-fashion chains and online platforms is intensifying.",
+                  "Foreign exchange exposure is limited to imported merchandise.",
+                  "Execution risk in opening several hundred stores a year."],
+        "emphasis": None,
+    },
+}
+
+
+def annual_report(ticker: str, annual: list[tuple[date, dict]], path: Path) -> int:
+    t = AR_TEXT[ticker]
+    fy26, fy25 = annual[-1][1], annual[-2][1]
+    g = (fy26["revenue"] / fy25["revenue"] - 1) * 100
+    em = fy26["ebitda"] / fy26["revenue"] * 100
+    de = fy26["borrowings"] / fy26["net_worth"]
+    sections = [
+        ("", [f"{t['name']}", "Annual Report FY26 (financial year ended 31 March 2026)",
+              "This is an illustrative demo document generated for the FINN prototype. It is not a real company filing."]),
+        ("Business Overview", [t["industry"], t["segments"], t["mix"]]),
+        ("<pagebreak>", []),
         ("Management Discussion and Analysis", [
-            f"Financial performance: Consolidated revenue from operations for FY26 was Rs. {a['revenue']:,.0f} crore compared with Rs. {p['revenue']:,.0f} crore in FY25, growth of {g:.1f}%. "
-            f"EBITDA was Rs. {a['ebitda']:,.0f} crore, an EBITDA margin of {em:.1f}%. Profit after tax was Rs. {a['pat']:,.0f} crore.",
-            f"Borrowings at the end of FY26 stood at Rs. {a['borrowings']:,.0f} crore and net worth at Rs. {a['net_worth']:,.0f} crore.",
-            f"Cash flow from operating activities was Rs. {a['cfo']:,.0f} crore during the year.",
+            f"Financial performance: Consolidated revenue from operations for FY26 was {_cr(fy26['revenue'])} against "
+            f"{_cr(fy25['revenue'])} in FY25, a growth of {g:.1f}%.",
+            f"EBITDA for FY26 was {_cr(fy26['ebitda'])}, an EBITDA margin of {em:.1f}%. Profit after tax was "
+            f"{_cr(fy26['pat'])} against {_cr(fy25['pat'])} in FY25.",
+            f"Borrowings at the end of FY26 were {_cr(fy26['borrowings'])} and net worth was {_cr(fy26['net_worth'])}, a "
+            f"debt-to-equity ratio of {de:.2f}. Cash flow from operating activities was {_cr(fy26['cfo'])}.",
         ]),
-        ("Outlook", [
-            "The Company remains optimistic about demand in the coming year, supported by new customers and capacity additions. "
-            "Management will continue to focus on execution, cost discipline and working capital.",
-        ]),
-        ("Risks and Concerns", [
-            "Key risks include customer concentration, volatility in input and commodity prices, changes in government incentive schemes, competition, "
-            "foreign exchange movements and execution risk on new capacity. "
-            + ("Gold price volatility affects demand and inventory value; gold metal loans used for hedging are part of borrowings." if t == "TITAN" else ""),
-        ]),
-        ("__PAGE__", []),
+        ("Outlook", [t["outlook"]]),
+        ("Risks and Concerns", t["risks"]),
+        ("<pagebreak>", []),
         ("Key Financial Ratios", [
-            f"Debtor days {a.get('debtor_days')} {p.get('debtor_days')} Inventory days {a.get('inventory_days')} {p.get('inventory_days')} "
-            f"ROE % {a.get('roe')} {p.get('roe')} ROCE % {a.get('roce')} {p.get('roce')} Debt equity {a['borrowings']/a['net_worth']:.2f} {p['borrowings']/p['net_worth']:.2f}",
-        ]),
+            f"Ratio FY26 FY25 | EBITDA margin % {em:.1f} {fy25['ebitda'] / fy25['revenue'] * 100:.1f} | "
+            f"ROE % {fy26['roe']:.1f} {fy25['roe']:.1f} | ROCE % {fy26['roce']:.1f} {fy25['roce']:.1f} | "
+            f"Debt to equity {de:.2f} {fy25['borrowings'] / fy25['net_worth']:.2f} | Debtor days {fy26['debtor_days']:.0f} "
+            f"{fy25['debtor_days']:.0f} | Inventory days {fy26['inventory_days']:.0f} {fy25['inventory_days']:.0f}"]),
         ("Notes to the Consolidated Financial Statements", [
-            f"Contingent liabilities: Claims against the Company not acknowledged as debts amount to Rs. {cl:,.1f} crore, primarily indirect tax and income tax matters under appeal. "
-            "Corporate guarantees given on behalf of subsidiaries are disclosed separately. Management believes the outcome will not have a material adverse effect.",
-            f"Related party transactions: Transactions with related parties during the year aggregated Rs. {rpt:,.1f} crore, principally purchase of goods and services from joint ventures "
-            "and associates, conducted at arm's length and in the ordinary course of business. All material related party transactions were approved by the Audit Committee.",
+            f"Contingent liabilities: Claims against the Company not acknowledged as debts, including disputed tax "
+            f"demands and guarantees, amount to {_cr(fy26['revenue'] * 0.011)} as at 31 March 2026.",
+            f"Related party transactions: Transactions with related parties during FY26 amounted to "
+            f"{_cr(fy26['revenue'] * 0.004)}. All related party transactions were in the ordinary course of business and "
+            "at arm's length.",
         ]),
-        ("__PAGE__", []),
+        ("<pagebreak>", []),
         ("Independent Auditor's Report", [
-            "Opinion: In our opinion and to the best of our information and according to the explanations given to us, the consolidated financial statements give a true and fair view "
-            "in conformity with Indian Accounting Standards. We have issued an unmodified opinion.",
-            "Key audit matters: revenue recognition and inventory valuation." + (" Emphasis of matter: we draw attention to the note on gold metal loans and inventory valuation; our opinion is not modified in respect of this matter." if t == "TITAN" else ""),
-        ]),
+            "Opinion: In our opinion, the consolidated financial statements give a true and fair view in conformity with "
+            "Indian Accounting Standards. We have issued an unmodified opinion.",
+        ] + ([t["emphasis"]] if t["emphasis"] else [])),
         ("Report on Corporate Governance", [
-            "Shareholding of promoters: As on 31 March 2026, no shares held by the promoter and promoter group were pledged or otherwise encumbered (pledged shares: Nil).",
+            "Shareholding of promoters: Promoter shares pledged or otherwise encumbered: Nil.",
         ]),
     ]
-    return sec
+    return write_pdf(path, f"{t['name']} - Annual Report FY26", sections)
 
 
-def _call_date(label: str) -> date:
-    from .research.periods import quarter_end
+TRANSCRIPTS: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "DIXON": {
+        "Q3 FY26": [
+            ("Moderator", "Ladies and gentlemen, good day and welcome to the Dixon Technologies Q3 FY26 earnings conference call."),
+            ("Managing Director", "Thank you. Demand from our mobile customers remained healthy through the festive season. For FY26 we expect revenue growth of 30% to 35%, driven by mobile phones and new EMS customers."),
+            ("Chief Financial Officer", "On profitability, we expect EBITDA margin for FY26 in the range of 3.9% to 4.1%. Working capital remains tight and we continue to manage it carefully."),
+            ("Analyst A", "Could you talk about investments in new capacity and how you plan to fund them?"),
+            ("Managing Director", "Capex for FY26 will be about Rs. 1,000 crore, largely for display modules and mobile capacity. We will fund it from internal accruals."),
+        ],
+        "Q4 FY26": [
+            ("Moderator", "Good day and welcome to the Dixon Technologies Q4 FY26 earnings conference call."),
+            ("Managing Director", "FY26 was an exceptional year and revenue grew about 38%. For FY27 we are guiding revenue growth of 30% to 35%."),
+            ("Chief Financial Officer", "For Q1 FY27 we expect EBITDA margin of 4.0% to 4.2%, helped by a richer mix."),
+            ("Analyst B", "How do you think about customer concentration risk in the mobile business?"),
+            ("Managing Director", "Customer concentration is a real risk for any EMS company. We are adding new customers across categories to reduce dependence on any single brand."),
+        ],
+        "Q1 FY27": [
+            ("Moderator", "Good day and welcome to the Dixon Technologies Q1 FY27 earnings conference call."),
+            ("Managing Director", "Q1 margins came in below our expectation because of component costs. Demand has been strong, so we are raising our FY27 guidance and now expect revenue growth of 35% to 40% for FY27."),
+            ("Chief Financial Officer", "For the next quarter we expect revenue growth of at least 30% year-on-year. We expect FY27 EBITDA margin of 3.8% to 4.0%."),
+            ("Analyst A", "What is happening with working capital as you scale up?"),
+            ("Chief Financial Officer", "Working capital days have improved as receivable days came down. We will keep a close eye on inventory as new lines ramp up."),
+        ],
+        "Q2 FY27": [
+            ("Moderator", "Good day and welcome to the Dixon Technologies Q2 FY27 earnings conference call."),
+            ("Managing Director", "Q2 revenue grew 38% year-on-year on strong mobile volumes. We maintain the FY27 guidance of revenue growth of 35% to 40%."),
+            ("Chief Financial Officer", "Over the medium term we aspire to an EBITDA margin of 4.5% as backward integration into components matures."),
+            ("Analyst B", "Thank you, that is helpful."),
+        ],
+    },
+    "TITAN": {
+        "Q3 FY26": [
+            ("Moderator", "Good day and welcome to the Titan Company Q3 FY26 earnings conference call."),
+            ("Managing Director", "The festive and wedding season was healthy for jewellery. We expect to close FY26 with revenue growth of around 20%."),
+            ("Chief Financial Officer", "We expect EBITDA margin for FY26 to be in the 11% to 11.5% band. Gold metal loans remain an important source of funding for our gold inventory."),
+            ("Analyst A", "Is the high gold price affecting buyer behaviour?"),
+            ("Managing Director", "Buyers are shifting to lighter-weight designs and exchange programmes when gold prices rise."),
+        ],
+        "Q4 FY26": [
+            ("Moderator", "Good day and welcome to the Titan Company Q4 FY26 earnings conference call."),
+            ("Managing Director", "FY26 revenue grew about 16%, below the 20% we had indicated. For FY27 we are guiding revenue growth of 18% to 20%."),
+            ("Chief Financial Officer", "For Q1 FY27 we expect revenue growth of 14% to 16%. We are targeting FY27 EBITDA margin of 11% to 11.5%."),
+            ("Analyst B", "Inventory seems to have gone up. Can you explain?"),
+            ("Chief Financial Officer", "Inventory has risen with new stores and higher gold prices. We are working to improve inventory turns."),
+        ],
+        "Q1 FY27": [
+            ("Moderator", "Good day and welcome to the Titan Company Q1 FY27 earnings conference call."),
+            ("Managing Director", "Given the gold price environment, we now expect FY27 revenue growth of 15% to 17%, lower than our earlier guidance."),
+            ("Chief Financial Officer", "We maintain the FY27 EBITDA margin guidance of 11% to 11.5%."),
+            ("Managing Director", "We plan to open around 60 new stores this year across formats."),
+            ("Analyst A", "Thank you for the clarity."),
+        ],
+        "Q2 FY27": [
+            ("Moderator", "Good day and welcome to the Titan Company Q2 FY27 earnings conference call."),
+            ("Managing Director", "Q2 revenue grew about 9% as high gold prices weighed on volumes."),
+            ("Chief Financial Officer", "With the festive season ahead, we expect the second half to show double-digit revenue growth with margins recovering."),
+            ("Analyst B", "Thank you."),
+        ],
+    },
+    "TRENT": {
+        "Q3 FY26": [
+            ("Moderator", "Good day and welcome to the Trent Ltd Q3 FY26 earnings conference call."),
+            ("Managing Director", "Zudio continues to lead our growth. We expect FY26 revenue growth of upwards of 25%."),
+            ("Chief Financial Officer", "We expect FY26 EBITDA margin of 16% to 17% on a pre-Ind AS 116 basis."),
+            ("Managing Director", "We plan to add about 200 Zudio stores in FY26."),
+            ("Analyst A", "How are like-for-like sales trending?"),
+        ],
+        "Q4 FY26": [
+            ("Moderator", "Good day and welcome to the Trent Ltd Q4 FY26 earnings conference call."),
+            ("Managing Director", "FY26 revenue grew about 22%. For FY27 we expect revenue growth of around 20%."),
+            ("Chief Financial Officer", "For Q1 FY27 we expect revenue growth of at least 15% year-on-year. Capex for FY27 will be about Rs. 1,500 crore, mainly for new stores and distribution centres."),
+            ("Analyst B", "Thank you."),
+        ],
+        "Q1 FY27": [
+            ("Moderator", "Good day and welcome to the Trent Ltd Q1 FY27 earnings conference call."),
+            ("Managing Director", "Q1 revenue grew about 17%. We maintain our FY27 guidance of revenue growth of around 20%."),
+            ("Chief Financial Officer", "We expect FY27 EBITDA margin of 17% to 18%."),
+            ("Managing Director", "We are piloting quick-commerce fashion delivery in two cities."),
+            ("Analyst A", "Thank you."),
+        ],
+        "Q2 FY27": [
+            ("Moderator", "Good day and welcome to the Trent Ltd Q2 FY27 earnings conference call."),
+            ("Managing Director", "Q2 revenue grew about 18.5% with Zudio crossing 900 stores."),
+            ("Chief Financial Officer", "We expect the next quarter to deliver revenue growth of 18% to 20%. We are confident of sustaining margins in the 17% to 18% range over the medium term."),
+            ("Analyst B", "Thank you."),
+        ],
+    },
+}
+CALL_QE = {"Q3 FY26": date(2025, 12, 31), "Q4 FY26": date(2026, 3, 31), "Q1 FY27": date(2026, 6, 30),
+           "Q2 FY27": date(2026, 9, 30)}
 
-    qe = quarter_end(label)
-    return qe + timedelta(days=33)
+
+def transcript_pdf(ticker: str, call: str, path: Path) -> int:
+    name = AR_TEXT[ticker]["name"]
+    turns = TRANSCRIPTS[ticker][call]
+    sections = [("", [f"{name} {call} earnings conference call transcript"]),
+                ("Opening Remarks", [f"{sp}: {tx}" for sp, tx in turns[:3]]),
+                ("Q&A Session", [f"{sp}: {tx}" for sp, tx in turns[3:]])]
+    return write_pdf(path, f"{name} - {call} Earnings Call Transcript", sections)
 
 
-def build_documents(s: Session, fins: dict) -> list[Document]:
-    from .research.ingest import index_pdf
-    from .research.periods import quarter_end
-
-    out_dir = settings.docs_dir / "demo"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    names = dict((x[0], x[1]) for x in ALL)
-    docs = []
-    for t, info in TX.items():
-        name = names[t]
-        # Annual report
-        ar_path = out_dir / f"{t}_AR_FY26.pdf"
-        _write_pdf(ar_path, f"{name} Annual Report FY26", _ar_sections(t, name, fins[t][1]))
-        docs.append(Document(ticker=t, doc_type="annual_report", title=f"{name} Annual Report FY26 (illustrative)", period_label="FY26",
-                             period_end=date(2026, 3, 31), url=f"demo://{t}/annual-report-FY26", local_path=str(ar_path), source="demo"))
-        # Transcripts: only calls that have already happened relative to the dataset date
-        for label, turns in info["calls"].items():
-            qe = quarter_end(label)
-            if qe is None or qe > fins[t][0][-1]["period_end"]:
-                continue
-            p = out_dir / f"{t}_concall_{label.replace(' ', '_')}.pdf"
-            paras = [f"Moderator: Ladies and gentlemen, welcome to the {name} earnings conference call for {label}."]
-            paras += [f"{sp}: {txt}" for sp, txt in turns]
-            paras.append("Moderator: That concludes the conference. Thank you for joining.")
-            _write_pdf(p, f"{name} {label} earnings call transcript", [(f"{name} - {label} Earnings Conference Call", paras)])
-            docs.append(Document(ticker=t, doc_type="transcript", title=f"{name} {label} earnings call transcript (illustrative)", period_label=label,
-                                 period_end=qe, url=f"demo://{t}/concall-{label.replace(' ', '-')}", local_path=str(p), source="demo"))
-    for d in docs:
-        s.add(d)
-        s.flush()
-        index_pdf(s, d)
+# ---------------------------------------------------------------- reset
+def _wipe(s: Session) -> None:
+    for model in (AlertEvent, AlertRule, Guidance, Chunk, Document, Announcement, FinancialPeriod, Price, Holding,
+                  ResearchLog, Meta, Company):
+        s.execute(delete(model))
     s.flush()
-    return docs
 
 
-# ------------------------------------------------------------------------------------ main
-
-DEMO_TODAY = date(2026, 11, 3)  # frozen so the planted scenarios line up with fiscal quarters
-
-
-def reset(s: Session, today: date | None = None) -> dict:
-    """Wipe and rebuild the illustrative dataset. Idempotent; used by `python -m finn.seed` and POST /api/system/demo-reset."""
-    for M in (AlertEvent, AlertRule, Guidance, Chunk, Document, Announcement, Price, FinancialPeriod, Holding, ResearchLog, Company, Meta):
-        s.execute(delete(M))
-    # LLM cache is kept on purpose: it is content-addressed and saves free-tier quota.
-    s.commit()
-    sess = last_session(today or DEMO_TODAY)
-    prev_sess = _weekdays_back(sess, 2)[0]
-    qe = latest_reported_quarter(sess)
-    qends = quarter_ends(qe, 10)
-    sessions = _weekdays_back(sess, 270)
-
-    fins = {}
-    for t, name, sector, fin in ALL:
-        s.add(Company(ticker=t, name=name, sector=sector, is_financial=fin, source="demo",
-                      about=f"{name} — {sector}. (Profile from the seed universe; illustrative demo mode.)"))
-        q, a = build_financials(t, fin, qends)
-        fins[t] = (q, a)
-        for row in q:
-            s.add(FinancialPeriod(ticker=t, period_type="Q", period_end=row["period_end"], label=row["label"], basis="consolidated",
-                                  metrics=row["metrics"], source="demo", source_url=None))
-        for row in a:
-            s.add(FinancialPeriod(ticker=t, period_type="Y", period_end=row["period_end"], label=row["label"], basis="consolidated",
-                                  metrics=row["metrics"], source="demo", source_url=None))
-        for p in build_prices(t, sessions):
-            s.add(Price(ticker=t, source="demo", **p))
-    s.flush()
+def reset(s: Session) -> dict[str, Any]:
+    _wipe(s)
+    docs_dir = settings.docs_dir / "demo"
+    if docs_dir.exists():
+        shutil.rmtree(docs_dir)
+    universe = PORTFOLIO + RESEARCH
+    for t, n, sec, f in universe:
+        s.add(Company(ticker=t, name=n, sector=sec, is_financial=f, about=ABOUT.get(t), source="demo"))
     for t, *_ in PORTFOLIO:
-        s.add(Holding(ticker=t))
-    for a in build_announcements(sess, fins, prev_sess):
+        s.add(Holding(ticker=t, source="demo"))
+    s.flush()
+    fin: dict[str, list[dict]] = {}
+    annual: dict[str, list] = {}
+    for t, n, sec, f in universe:
+        q = _quarter_rows(t, f)
+        fin[t] = q
+        for qe, m in zip(QUARTER_ENDS, q):
+            s.add(FinancialPeriod(ticker=t, period_type="Q", period_end=qe, label=month_label(qe), basis="consolidated",
+                                  metrics=m, source="demo", source_url=f"demo://{t}/financials"))
+        annual[t] = _annual_rows(t, q, f)
+        for fe, m in annual[t]:
+            s.add(FinancialPeriod(ticker=t, period_type="Y", period_end=fe, label=month_label(fe), basis="consolidated",
+                                  metrics=m, source="demo", source_url=f"demo://{t}/financials"))
+        for row in _prices(t):
+            s.add(Price(**row))
+    s.flush()
+    for a in announcements(fin):
         s.add(Announcement(**a))
     s.flush()
-    build_documents(s, fins)
-    s.add(Meta(key="data_mode", value={"mode": "demo", "as_of": sess.isoformat(), "generated_at": datetime.utcnow().isoformat(),
-                                       "note": "Illustrative synthetic data. Run `python -m finn.refresh` for live NSE/Yahoo/screener data."}))
-    s.commit()
-
-    from .research import guidance
-    from .services import alerts, signals
-
+    for t in STORY:
+        path = docs_dir / f"{t}_AR_FY26.pdf"
+        annual_report(t, annual[t], path)
+        d = Document(ticker=t, doc_type="annual_report", title=f"{AR_TEXT[t]['name']} Annual Report FY26",
+                     url=f"demo://{t}/annual-report/FY26", period_label="FY26", period_end=date(2026, 3, 31),
+                     local_path=str(path), status="downloaded", source="demo")
+        s.add(d)
+        for call, qe in CALL_QE.items():
+            p = docs_dir / f"{t}_concall_{call.replace(' ', '_')}.pdf"
+            transcript_pdf(t, call, p)
+            s.add(Document(ticker=t, doc_type="transcript", title=f"{t} {call} earnings call transcript",
+                           url=f"demo://{t}/transcript/{call.replace(' ', '-')}", period_label=call, period_end=qe,
+                           local_path=str(p), status="downloaded", source="demo"))
+    s.flush()
+    for d in s.query(Document).all():
+        ingest.ingest_document(s, d)
+    set_meta(s, "data_mode", "demo")
+    set_meta(s, "source_status", {
+        "demo": {"ok": True, "detail": f"Illustrative dataset frozen at {DEMO_TODAY.isoformat()}",
+                 "at": datetime.now().isoformat(timespec="seconds")}})
     alerts.seed_defaults(s)
     signals.process(s, force=True)
     alerts.evaluate(s)
-    for t in TX:
-        guidance.extract(s, t)
-    return {"as_of": sess.isoformat(), "companies": len(ALL), "portfolio": len(PORTFOLIO), "adhoc": len(ADHOC)}
+    for t in STORY:
+        G.extract(s, t)
+    s.flush()
+    return {"companies": len(universe), "announcements": s.query(Announcement).count(),
+            "documents": s.query(Document).count(), "chunks": s.query(Chunk).count()}

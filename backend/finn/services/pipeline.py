@@ -1,198 +1,185 @@
-"""Live ingestion orchestration, shared by the `python -m finn.refresh` CLI and the API's on-demand research.
-
-Each source runs independently and records its own status — one blocked source never stops the others,
-and a failure is reported, never papered over with fabricated data.
-"""
+"""Live ingestion pipeline. Each source runs independently; failures are recorded, never papered over."""
 from __future__ import annotations
 
 import logging
 import re
 from datetime import date, datetime, timedelta
+from typing import Any, Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..config import now_ist, settings
-from ..models import (AlertEvent, Announcement, Chunk, Company, Document, FinancialPeriod, Guidance, Holding, Meta, Price)
-from ..universe import ALL, PORTFOLIO
-from . import alerts, signals, taxonomy
+from ..db import get_meta, set_meta
+from ..models import (AlertEvent, Announcement, Chunk, Company, Document, FinancialPeriod, Guidance, Holding, Price)
+from ..research import guidance as G, ingest
+from ..research.periods import fy_label, month_label, prev_quarter_end_before, quarter_label
+from ..universe import BY_TICKER, PORTFOLIO, valid_ticker
+from . import alerts, signals
+from .taxonomy import classify_rules
 
 log = logging.getLogger("finn.pipeline")
-TICKER_RE = re.compile(r"^[A-Z0-9&\-]{1,20}$")
+SKIP_ATTACH = {"unclassified", "investor_meetings", "agm_egm", "postal_ballot", "earnings_call"}
 
 
-def set_status(s: Session, source: str, ok: bool, detail: str) -> None:
-    m = s.get(Meta, "source_status") or Meta(key="source_status", value={})
-    v = dict(m.value)
-    v[source] = {"ok": ok, "detail": detail, "at": now_ist().isoformat(timespec="seconds")}
-    m.value = v
-    s.merge(m)
-    s.commit()
+def _status(s: Session, source: str, ok: bool, detail: str) -> None:
+    st = get_meta(s, "source_status", {}) or {}
+    st[source] = {"ok": ok, "detail": detail, "at": now_ist().isoformat(timespec="seconds")}
+    set_meta(s, "source_status", st)
 
 
-def data_mode(s: Session) -> dict:
-    m = s.get(Meta, "data_mode")
-    return m.value if m else {"mode": "empty"}
-
-
-def purge_demo(s: Session) -> None:
-    """Switching to live data removes every illustrative row so the two can never mix."""
-    for M in (Price, FinancialPeriod, Announcement):
-        s.execute(delete(M).where(M.source == "demo"))
-    demo_docs = s.scalars(select(Document.id).where(Document.source == "demo")).all()
-    if demo_docs:
-        s.execute(delete(Guidance).where(Guidance.document_id.in_(demo_docs)))
-        s.execute(delete(Chunk).where(Chunk.document_id.in_(demo_docs)))
-        s.execute(delete(Document).where(Document.id.in_(demo_docs)))
-    s.execute(delete(AlertEvent))
-    s.commit()
-
-
-def ensure_company(s: Session, ticker: str) -> Company | None:
-    ticker = ticker.upper().strip()
-    if not TICKER_RE.match(ticker):
+def ensure_company(s: Session, ticker: str) -> Optional[Company]:
+    if not valid_ticker(ticker):
         return None
     c = s.get(Company, ticker)
     if c:
         return c
-    seed = next((x for x in ALL if x[0] == ticker), None)
-    if seed:
-        c = Company(ticker=ticker, name=seed[1], sector=seed[2], is_financial=seed[3], source="seed")
+    if ticker in BY_TICKER:
+        t, n, sec, fin = BY_TICKER[ticker]
+        c = Company(ticker=t, name=n, sector=sec, is_financial=fin, source="nse")
     else:
-        from ..connectors import prices
-
-        info = prices.company_info(ticker)
+        from ..connectors.prices import company_info
+        info = company_info(ticker)
         if not info:
             return None
-        c = Company(ticker=ticker, name=info["name"], sector=info["sector"], is_financial=info["is_financial"], about=info["about"], source="yfinance")
+        c = Company(**info)
     s.add(c)
-    s.commit()
+    s.flush()
     return c
 
 
-def refresh_prices(s: Session, tickers: list[str]) -> None:
-    from ..connectors import prices
-
-    try:
-        data = prices.fetch(tickers)
-        n = sum(prices.store(s, t, rows) for t, rows in data.items())
-        missing = [t for t, r in data.items() if not r]
-        s.commit()
-        set_status(s, "prices", n > 0, f"{n} EOD rows for {len(tickers) - len(missing)}/{len(tickers)} tickers" + (f"; missing {', '.join(missing)}" if missing else ""))
-    except Exception as e:
-        s.rollback()
-        log.exception("price refresh failed")
-        set_status(s, "prices", False, f"yfinance failed: {e}")
+def purge_demo(s: Session) -> None:
+    for model in (AlertEvent, Guidance, Chunk, Document, Announcement, FinancialPeriod, Price, Holding, Company):
+        if hasattr(model, "source"):
+            s.execute(delete(model).where(model.source == "demo"))
+    s.flush()
 
 
-def refresh_announcements(s: Session, tickers: list[str], days: int = 7) -> None:
-    from ..connectors.nse import NSEClient
+def refresh_prices(s: Session, tickers: list[str]) -> int:
+    from ..connectors.prices import fetch, upsert_prices
+    data = fetch(tickers)
+    n = 0
+    for t, rows in data.items():
+        n += upsert_prices(s, rows)
+    return n
 
-    cli = NSEClient()
+
+def refresh_announcements(s: Session, tickers: list[str], days: int = 7) -> int:
+    from ..connectors.nse import NSE
+    nse = NSE()
     end = now_ist().date()
     start = end - timedelta(days=days)
-    n_new, n_att, errors = 0, 0, []
+    n = 0
     for t in tickers:
-        try:
-            for a in cli.announcements(t, start, end):
-                if s.scalar(select(Announcement.id).where(Announcement.dedupe_key == a["dedupe_key"])):
-                    continue
-                # cost discipline: only download attachments for filings the rules don't already call routine
-                pre = taxonomy.classify(a["subject"], a["exchange_category"])
-                if a["attachment_url"] and pre.category not in ("unclassified", "investor_meetings", "agm_egm", "postal_ballot", "earnings_call"):
-                    a["attachment_text"] = cli.pdf_text(a["attachment_url"])
-                    n_att += bool(a["attachment_text"])
-                s.add(Announcement(**a))
-                n_new += 1
-            s.commit()
-        except Exception as e:
-            s.rollback()
-            errors.append(f"{t}: {str(e)[:80]}")
-    ok = n_new > 0 or not errors
-    set_status(s, "announcements", ok, f"{n_new} new filings, {n_att} attachments parsed" + (f"; {len(errors)} errors (e.g. {errors[0]})" if errors else ""))
+        for a in nse.announcements(t, start, end):
+            if not a["published_at"] or s.scalars(select(Announcement.id).where(
+                    Announcement.dedupe_key == a["dedupe_key"])).first():
+                continue
+            pre = classify_rules(a["subject"], a["exchange_category"], a["body"])
+            if a["attachment_url"] and (pre is None or pre[0] not in SKIP_ATTACH):
+                a["attachment_text"] = nse.pdf_text(a["attachment_url"])  # cost discipline: only for material types
+            s.add(Announcement(**a))
+            n += 1
+        s.flush()
+        import time
+        time.sleep(0.7)
+    return n
 
 
-def refresh_fundamentals(s: Session, ticker: str, with_docs: bool = False, max_transcripts: int = 4) -> dict:
-    from ..connectors.screener import ScreenerClient
-    from ..research import guidance
-    from ..research.ingest import index_pdf
-    from ..research.periods import quarter_label
+def transcript_quarter(call_month: str) -> Optional[date]:
+    m = re.search(r"([A-Za-z]{3})\s+(\d{4})", call_month or "")
+    if not m:
+        return None
+    months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    if m.group(1).lower() not in months:
+        return None
+    return prev_quarter_end_before(int(m.group(2)), months.index(m.group(1).lower()) + 1)
 
-    cli = ScreenerClient()
-    f = cli.fundamentals(ticker)
-    c = ensure_company(s, ticker)
-    if c:
-        c.is_financial = f["is_financial"] or c.is_financial
-        c.about = c.about or f["about"]
-    for ptype, rows in (("Q", f["quarters"]), ("Y", f["annual"])):
-        for r in rows:
-            existing = s.scalar(select(FinancialPeriod).where(FinancialPeriod.ticker == ticker, FinancialPeriod.period_type == ptype,
-                                                              FinancialPeriod.period_end == r["period_end"], FinancialPeriod.basis == f["basis"]))
-            if existing:
-                existing.metrics, existing.source_url = r["metrics"], f["url"]
+
+def refresh_fundamentals(s: Session, ticker: str, with_docs: bool = True) -> dict[str, Any]:
+    from ..connectors import screener
+    data = screener.fetch_company(ticker)
+    comp = ensure_company(s, ticker)
+    if comp is not None:
+        comp.is_financial = comp.is_financial or data["is_financial"]
+        if data.get("about"):
+            comp.about = data["about"]
+    for ptype, table in (("Q", data["quarters"]), ("Y", data["annual"])):
+        for d, metrics in table.items():
+            row = s.scalars(select(FinancialPeriod).where(
+                FinancialPeriod.ticker == ticker, FinancialPeriod.period_type == ptype, FinancialPeriod.period_end == d,
+                FinancialPeriod.basis == data["basis"])).first()
+            label = month_label(d)
+            if row is None:
+                s.add(FinancialPeriod(ticker=ticker, period_type=ptype, period_end=d, label=label, basis=data["basis"],
+                                      metrics=metrics, source="screener", source_url=data["url"]))
             else:
-                s.add(FinancialPeriod(ticker=ticker, period_type=ptype, period_end=r["period_end"], label=r["label"], basis=f["basis"],
-                                      metrics=r["metrics"], source="screener", source_url=f["url"]))
-    s.commit()
-    n_docs = 0
+                row.metrics, row.source, row.source_url = metrics, "screener", data["url"]
+    s.flush()
+    docs_done = 0
     if with_docs:
-        txs = [d for d in f["documents"] if d["doc_type"] == "transcript"][:max_transcripts]
-        ars = [d for d in f["documents"] if d["doc_type"] == "annual_report"][:1]
+        ars = [d for d in data["documents"] if d["doc_type"] == "annual_report"][:1]
+        txs = [d for d in data["documents"] if d["doc_type"] == "transcript"][:4]
         for d in ars + txs:
-            doc = s.scalar(select(Document).where(Document.ticker == ticker, Document.url == d["url"]))
-            if not doc:
-                pe = d.get("period_end")
-                label = d.get("period_label")
-                if d["doc_type"] == "transcript" and d.get("call_date"):
-                    # a call in month M discusses the quarter that ended ~1-2 months earlier
-                    cd = d["call_date"]
-                    qm, qy = ((cd.month - 1) // 3) * 3, cd.year  # most recent quarter-end strictly before the call month
-                    if qm == 0:
-                        qm, qy = 12, cd.year - 1
-                    import calendar
-
-                    pe = date(qy, qm, calendar.monthrange(qy, qm)[1])
-                    label = quarter_label(pe)
-                doc = Document(ticker=ticker, doc_type=d["doc_type"], title=d["title"], url=d["url"], period_label=label, period_end=pe, source="screener")
+            if d["doc_type"] == "transcript":
+                qe = transcript_quarter(d.get("call_month", ""))
+                d["period_end"] = qe
+                d["period_label"] = quarter_label(qe) if qe else None
+            doc = s.scalars(select(Document).where(Document.ticker == ticker, Document.url == d["url"])).first()
+            if doc is None:
+                doc = Document(ticker=ticker, doc_type=d["doc_type"], title=d["title"], url=d["url"],
+                               period_label=d.get("period_label"), period_end=d.get("period_end"), source="screener")
                 s.add(doc)
                 s.flush()
-            if doc.status != "indexed":
-                path = settings.docs_dir / f"{ticker}_{doc.id}.pdf"
-                if cli.download(doc.url, path):
-                    doc.local_path = str(path)
-                    n_docs += bool(index_pdf(s, doc))
-                else:
-                    doc.status, doc.error = "failed", "download failed or not a PDF"
-            s.commit()
-        guidance.extract(s, ticker)
-    return {"ticker": ticker, "quarters": len(f["quarters"]), "years": len(f["annual"]), "documents_indexed": n_docs, "basis": f["basis"]}
+            dest = settings.docs_dir / ticker / f"{doc.id}.pdf"
+            try:
+                screener.download(d["url"], dest)
+                doc.local_path, doc.status = str(dest), "downloaded"
+                ingest.ingest_document(s, doc)
+                docs_done += 1
+            except Exception as e:
+                doc.status, doc.error = "failed", str(e)[:300]
+        s.flush()
+        G.extract(s, ticker)
+    return {"quarters": len(data["quarters"]), "years": len(data["annual"]), "documents": docs_done,
+            "basis": data["basis"]}
 
 
-def refresh_all(s: Session, tickers: list[str] | None = None, research: list[str] | None = None, days: int = 7, docs: bool = True) -> dict:
-    holdings = tickers or s.scalars(select(Holding.ticker)).all() or [p[0] for p in PORTFOLIO]
-    if data_mode(s).get("mode") == "demo":
-        purge_demo(s)
-    for t in holdings:
-        ensure_company(s, t)
-        if not s.scalar(select(Holding.id).where(Holding.ticker == t)):
-            s.add(Holding(ticker=t))
-    s.commit()
+def refresh_all(s: Session, tickers: Optional[list[str]] = None, research: Optional[list[str]] = None,
+                days: int = 7, with_docs: bool = True) -> dict[str, Any]:
+    tickers = tickers or [t for t, *_ in PORTFOLIO]
     research = research or []
-    refresh_prices(s, list(dict.fromkeys(holdings + research)))
-    refresh_announcements(s, holdings, days)
-    fund_ok, fund_err = 0, []
-    for t in dict.fromkeys(holdings + research):
+    if get_meta(s, "data_mode", "demo") == "demo":
+        purge_demo(s)
+    for t in tickers + research:
+        ensure_company(s, t)
+    for t in tickers:
+        if not s.scalars(select(Holding).where(Holding.ticker == t)).first() and s.get(Company, t):
+            s.add(Holding(ticker=t, source="nse"))
+    s.flush()
+    report: dict[str, Any] = {}
+    for name, fn in (("yfinance", lambda: refresh_prices(s, tickers + research)),
+                     ("nse", lambda: refresh_announcements(s, tickers, days))):
         try:
-            refresh_fundamentals(s, t, with_docs=docs and t in research)
-            fund_ok += 1
+            with s.begin_nested():
+                n = fn()
+            _status(s, name, True, f"{n} rows")
+            report[name] = n
         except Exception as e:
-            s.rollback()
-            fund_err.append(f"{t}: {str(e)[:60]}")
-    set_status(s, "fundamentals", fund_ok > 0, f"{fund_ok} companies" + (f"; failed: {'; '.join(fund_err[:3])}" if fund_err else ""))
-    s.merge(Meta(key="data_mode", value={"mode": "live", "as_of": now_ist().date().isoformat(), "generated_at": now_ist().isoformat(timespec="seconds"),
-                                         "note": "Live EOD data from Yahoo Finance, NSE filings and screener.in, as of the last refresh."}))
-    s.commit()
+            _status(s, name, False, str(e)[:300])
+            report[name] = f"failed: {e}"
+    ok_f, fail_f = 0, []
+    for t in tickers + research:
+        try:
+            with s.begin_nested():
+                refresh_fundamentals(s, t, with_docs=with_docs and t in research)  # docs only for research names
+            ok_f += 1
+        except Exception as e:
+            fail_f.append(f"{t}: {str(e)[:80]}")
+    _status(s, "screener", ok_f > 0, f"{ok_f} companies ok" + (f"; failed {', '.join(fail_f[:5])}" if fail_f else ""))
+    report["screener"] = {"ok": ok_f, "failed": fail_f}
+    set_meta(s, "data_mode", "live")
     alerts.seed_defaults(s)
     signals.process(s, force=True)
     alerts.evaluate(s)
-    return {"holdings": len(holdings), "research": research, "status": s.get(Meta, "source_status").value}
+    return report

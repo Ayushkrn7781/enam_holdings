@@ -1,515 +1,632 @@
-"""FINN HTTP API. Handlers stay thin: validation + serialisation; logic lives in services/ and research/."""
+"""FastAPI app: thin handlers over the services. Also serves the built SPA."""
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
 
-from ..config import settings
-from ..db import SessionLocal, get_session, init_db, session_scope
-from ..models import AlertEvent, AlertRule, Announcement, Company, Document, FinancialPeriod, Holding, Meta, Price
-from ..research import answer, guidance, health, retrieval
-from ..services import alerts, digest, llm, market, materiality, pipeline, signals
-from ..services.results import periods, results_card
-from ..services.taxonomy import CATEGORIES
-from ..universe import ALL
+from .. import db as DB
+from .. import demo
+from ..config import BACKEND_DIR, now_ist, settings
+from ..db import get_meta, init_db, session_scope, set_meta
+from ..models import (AlertEvent, AlertRule, Announcement, Chunk, Company, Document, FinancialPeriod, Guidance, Holding,
+                      Price)
+from ..research import answer as R, guidance as G, health as H, retrieval
+from ..research.periods import quarter_label
+from ..services import alerts as AL, digest as D, llm, market, materiality as M, results, signals
+from ..services.taxonomy import IMPORTANCE, LABELS, categories
+from ..universe import ALL, BY_TICKER, normalise, valid_ticker
 
 log = logging.getLogger("finn.api")
-app = FastAPI(title="FINN API", version="1.0", description="Financial Investment Agent — push signals and evidence-backed research for NSE companies.")
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="FINN", version="1.0", description="Financial investment agent: push digest + grounded research")
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+# ---------------------------------------------------------------- lifecycle + middleware
+def restore_snapshot(force: bool = False) -> bool:
+    snap = settings.snapshot_dir / "finn.db"
+    dbp = settings.db_path
+    if dbp is None or not snap.exists():
+        return False
+    if dbp.exists() and not force:
+        return False
+    DB.dispose()
+    for suf in ("", "-wal", "-shm"):
+        p = Path(str(dbp) + suf)
+        if p.exists():
+            p.unlink()
+    dbp.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(snap, dbp)
+    src_docs = settings.snapshot_dir / "docs"
+    if src_docs.exists():
+        dest = settings.docs_dir
+        shutil.copytree(src_docs, dest, dirs_exist_ok=True)
+    retrieval.invalidate()
+    return True
 
 
 @app.on_event("startup")
 def _startup() -> None:
+    restore_snapshot()
     init_db()
     with session_scope() as s:
-        if not s.scalar(select(func.count()).select_from(Company)):
-            from .. import demo
-
-            log.info("empty database — building illustrative demo dataset")
+        if s.scalars(select(Company)).first() is None:
             demo.reset(s)
 
 
 @app.middleware("http")
 async def _timing(request: Request, call_next):
-    t0 = time.time()
+    t0 = time.perf_counter()
     resp = await call_next(request)
-    resp.headers["X-Response-Time-ms"] = str(int((time.time() - t0) * 1000))
+    resp.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - t0) * 1000:.1f}"
     return resp
 
 
+@app.exception_handler(HTTPException)
+async def _http_exc(_req: Request, exc: HTTPException):
+    code = {404: "not_found", 422: "invalid", 400: "bad_request"}.get(exc.status_code, "error")
+    return JSONResponse({"error": code, "detail": exc.detail}, status_code=exc.status_code)
+
+
 @app.exception_handler(Exception)
-async def _err(request: Request, exc: Exception):
-    log.exception("unhandled error on %s", request.url.path)
-    return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)[:300]})
+async def _any_exc(_req: Request, exc: Exception):
+    log.exception("unhandled")
+    return JSONResponse({"error": "internal_error", "detail": str(exc)[:300]}, status_code=500)
 
 
 def _404(what: str):
-    raise HTTPException(status_code=404, detail={"error": "not_found", "detail": what})
+    raise HTTPException(404, what)
 
 
-def _ticker(s: Session, ticker: str) -> Company:
-    c = s.get(Company, ticker.upper())
-    if not c:
-        _404(f"Unknown ticker {ticker}")
-    return c
+def _ticker(t: str) -> str:
+    t = normalise(t)
+    if not valid_ticker(t):
+        raise HTTPException(422, f"'{t}' is not a valid NSE symbol")
+    return t
 
 
-# ------------------------------------------------------------------ system
-
+# ---------------------------------------------------------------- system
 @app.get("/api/health")
 def health_check():
-    return {"ok": True, "time": datetime.utcnow().isoformat()}
+    return {"ok": True, "time": now_ist().isoformat(timespec="seconds")}
 
 
 @app.get("/api/system/data-status")
-def data_status(s: Session = Depends(get_session)):
-    mode = pipeline.data_mode(s)
-    src = s.get(Meta, "source_status")
-    counts = {name: s.scalar(select(func.count()).select_from(M)) for name, M in
-              (("companies", Company), ("prices", Price), ("announcements", Announcement), ("financial_periods", FinancialPeriod), ("documents", Document))}
-    last_px = s.scalar(select(func.max(Price.date)))
-    return {"mode": mode, "sources": src.value if src else {}, "counts": counts, "last_eod_session": last_px.isoformat() if last_px else None,
-            "monitoring": "End-of-day: prices and filings are evaluated once per refresh (scheduled after market close). Not real-time.",
-            "llm": llm.stats(), "retrieval": retrieval.mode()}
+def data_status():
+    with session_scope() as s:
+        counts = {name: s.scalar(select(func.count()).select_from(m)) for name, m in (
+            ("companies", Company), ("holdings", Holding), ("prices", Price), ("announcements", Announcement),
+            ("financial_periods", FinancialPeriod), ("documents", Document), ("chunks", Chunk), ("guidance", Guidance),
+            ("alert_rules", AlertRule), ("alert_events", AlertEvent))}
+        last = s.scalar(select(func.max(Price.date)))
+        mode = get_meta(s, "data_mode", "demo")
+        return {"mode": mode, "sources": get_meta(s, "source_status", {}), "counts": counts,
+                "last_eod_session": last.isoformat() if last else None, "anchor": AL.anchor(s).isoformat(),
+                "monitoring_note": AL.MONITORING_NOTE, "llm": llm.stats(), "retrieval": retrieval.mode(),
+                "refresh_command": "./run.sh refresh   (or: cd backend && python -m finn.refresh)",
+                "demo_note": ("ILLUSTRATIVE DEMO DATA: synthetic figures, fictional people, frozen at "
+                              f"{demo.DEMO_TODAY:%d %b %Y}. Run a live refresh to replace it.") if mode == "demo" else None}
 
 
 @app.post("/api/system/demo-reset")
-def demo_reset(s: Session = Depends(get_session)):
-    import os
-    import shutil
-
-    snap = os.getenv("FINN_SNAPSHOT_DIR")
-    if snap and Path(snap, "finn.db").exists():
-        # serverless deploy: restore the prebuilt snapshot instead of regenerating (no PDF library there)
-        s.close()
-        from ..db import engine
-
-        engine.dispose()
-        db = Path(settings.database_url.replace("sqlite:///", ""))
-        for suffix in ("-wal", "-shm"):
-            Path(str(db) + suffix).unlink(missing_ok=True)
-        shutil.copy2(Path(snap, "finn.db"), db)
-        return {"restored": "snapshot"}
-    from .. import demo
-
-    return demo.reset(s)
+def demo_reset():
+    if restore_snapshot(force=True):
+        init_db()
+        return {"ok": True, "method": "snapshot"}
+    with session_scope() as s:
+        out = demo.reset(s)
+    retrieval.invalidate()
+    return {"ok": True, "method": "rebuild", **out}
 
 
 @app.get("/api/system/eval")
 def eval_results():
-    p = Path(__file__).resolve().parents[2] / "eval" / "results.json"
+    p = BACKEND_DIR / "eval" / "results.json"
     if not p.exists():
         return {"available": False}
-    import json
-
     return {"available": True, **json.loads(p.read_text())}
 
 
 @app.get("/api/meta/categories")
-def categories():
-    return [{"key": k, **v} for k, v in CATEGORIES.items()]
+def meta_categories():
+    return {"categories": categories()}
 
 
-# ------------------------------------------------------------------ portfolio & companies
+# ---------------------------------------------------------------- portfolio + companies
+def _price_rows(s, t, days: Optional[int] = None):
+    q = select(Price).where(Price.ticker == t).order_by(Price.date)
+    rows = s.scalars(q).all()
+    return rows[-days:] if days else rows
 
-def _company_card(s: Session, c: Company, holdings: set[str]) -> dict:
-    rows = market.series(s, c.ticker, 260)
-    snap = market.snapshot(rows)
-    since = digest.anchor_time(s) - timedelta(days=7)
-    sig = s.execute(select(func.count(), func.max(Announcement.score)).where(Announcement.ticker == c.ticker, Announcement.published_at >= since,
-                                                                           Announcement.priority.in_(["critical", "high", "medium"]))).one()
-    card = results_card(s, c.ticker)
-    return {"ticker": c.ticker, "name": c.name, "sector": c.sector, "is_financial": c.is_financial, "in_portfolio": c.ticker in holdings,
-            "price": snap, "spark": [r.close for r in rows[-60:]], "signals_7d": sig[0], "top_score_7d": sig[1],
-            "latest_quarter": {"period": card["period"], "rows": [{k: r[k] for k in ("metric", "label", "current", "yoy_pct")} for r in card["rows"]]} if card else None,
-            "has_documents": bool(s.scalar(select(func.count()).select_from(Document).where(Document.ticker == c.ticker, Document.status == "indexed")))}
+
+def _portfolio_item(s, c: Company, in_pf: bool, since: datetime) -> dict:
+    rows = _price_rows(s, c.ticker)
+    snap = market.snapshot(rows) if rows else None
+    sig = s.scalars(select(Announcement).where(Announcement.ticker == c.ticker, Announcement.published_at >= since,
+                                               Announcement.is_duplicate_of.is_(None))).all()
+    material = [a for a in sig if a.priority in ("critical", "high", "medium")]
+    top = max(material, key=lambda a: a.score or 0, default=None)
+    card = results.results_card(s, c.ticker)
+    lq = None
+    if card:
+        r = {x["key"]: x for x in card["rows"]}
+        lq = {"period_label": card["period_label"], "revenue_yoy": r["revenue"]["yoy"], "pat_yoy": r["pat"]["yoy"]}
+    has_docs = s.scalars(select(Document.id).where(Document.ticker == c.ticker, Document.status == "indexed")).first()
+    return {"ticker": c.ticker, "name": c.name, "sector": c.sector, "is_financial": c.is_financial, "in_portfolio": in_pf,
+            "price": snap, "spark": [r.close for r in rows[-60:]], "signals_7d": len(material),
+            "top_score_7d": top.score if top else None, "top_priority_7d": top.priority if top else None,
+            "latest_quarter": lq, "has_documents": bool(has_docs), "source": c.source}
 
 
 @app.get("/api/portfolio")
-def get_portfolio(sector: str | None = None, s: Session = Depends(get_session)):
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    cos = s.scalars(select(Company).where(Company.ticker.in_(holdings)).order_by(Company.ticker)).all()
-    items = [_company_card(s, c, holdings) for c in cos if not sector or c.sector == sector]
-    return {"items": items, "sectors": sorted({c.sector for c in cos}), "count": len(items)}
+def portfolio():
+    with session_scope() as s:
+        at = AL.anchor(s)
+        hs = s.scalars(select(Holding)).all()
+        items = []
+        for h in hs:
+            c = s.get(Company, h.ticker)
+            if c:
+                items.append(_portfolio_item(s, c, True, at - timedelta(days=7)))
+        items.sort(key=lambda x: x["ticker"])
+        sectors = sorted({i["sector"] for i in items if i["sector"]})
+        rets = [i["price"]["return_pct"] for i in items if i["price"] and i["price"]["return_pct"] is not None]
+        last = max((i["price"]["date"] for i in items if i["price"]), default=None)
+        return {"items": items, "sectors": sectors, "count": len(items),
+                "summary": {"equal_weight_move": round(sum(rets) / len(rets), 2) if rets else None,
+                            "up": sum(r > 0 for r in rets), "down": sum(r < 0 for r in rets), "date": last},
+                "data_mode": get_meta(s, "data_mode", "demo")}
 
 
 class AddHolding(BaseModel):
-    ticker: str = Field(min_length=1, max_length=20)
+    ticker: str
 
 
-@app.post("/api/portfolio", status_code=201)
-def add_holding(body: AddHolding, bg: BackgroundTasks, s: Session = Depends(get_session)):
-    c = pipeline.ensure_company(s, body.ticker)
-    if not c:
-        raise HTTPException(422, detail={"error": "unknown_ticker", "detail": f"{body.ticker} is not a recognised NSE symbol (or the data source is unreachable)."})
-    if not s.scalar(select(Holding.id).where(Holding.ticker == c.ticker)):
-        s.add(Holding(ticker=c.ticker))
-        s.commit()
-    if pipeline.data_mode(s).get("mode") == "live":
-        bg.add_task(_bg_ingest, c.ticker, False)
-    return {"ok": True, "ticker": c.ticker}
+@app.post("/api/portfolio")
+def portfolio_add(body: AddHolding):
+    from ..services.pipeline import ensure_company
+    t = _ticker(body.ticker)
+    with session_scope() as s:
+        c = ensure_company(s, t)
+        if c is None:
+            raise HTTPException(422, f"Could not find NSE company '{t}'")
+        if not s.scalars(select(Holding).where(Holding.ticker == t)).first():
+            s.add(Holding(ticker=t, source=c.source))
+        s.flush()
+        return _portfolio_item(s, c, True, AL.anchor(s) - timedelta(days=7))
 
 
 @app.delete("/api/portfolio/{ticker}")
-def remove_holding(ticker: str, s: Session = Depends(get_session)):
-    h = s.scalar(select(Holding).where(Holding.ticker == ticker.upper()))
-    if not h:
-        _404(f"{ticker} is not in the portfolio")
-    s.delete(h)
-    s.commit()
-    return {"ok": True}
+def portfolio_remove(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        h = s.scalars(select(Holding).where(Holding.ticker == t)).first()
+        if not h:
+            _404(f"{t} is not in the portfolio")
+        s.delete(h)
+        return {"ok": True, "ticker": t}
 
 
 @app.get("/api/companies/search")
-def search_companies(q: str = Query("", max_length=40), s: Session = Depends(get_session)):
-    ql = q.strip().upper()
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    known = {c.ticker: c for c in s.scalars(select(Company)).all()}
-    pool = [{"ticker": t, "name": c.name, "sector": c.sector, "known": True, "in_portfolio": t in holdings} for t, c in known.items()]
-    pool += [{"ticker": t, "name": n, "sector": sec, "known": False, "in_portfolio": False} for t, n, sec, _ in ALL if t not in known]
-    hits = [p for p in pool if not ql or ql in p["ticker"] or ql in p["name"].upper()]
-    hits.sort(key=lambda p: (not p["ticker"].startswith(ql), p["ticker"]))
-    if ql and pipeline.TICKER_RE.match(ql) and not any(h["ticker"] == ql for h in hits):
-        hits.append({"ticker": ql, "name": f"{ql} (any NSE symbol)", "sector": None, "known": False, "in_portfolio": False})
-    return hits[:12]
+def companies_search(q: str = ""):
+    qq = q.strip().upper()
+    with session_scope() as s:
+        known = {c.ticker: c for c in s.scalars(select(Company)).all()}
+        held = {h.ticker for h in s.scalars(select(Holding)).all()}
+        pool = {t: (n, sec) for t, n, sec, _ in ALL}
+        for t, c in known.items():
+            pool[t] = (c.name, c.sector)
+        out = []
+        for t, (n, sec) in sorted(pool.items()):
+            if not qq or qq in t or qq in (n or "").upper():
+                out.append({"ticker": t, "name": n, "sector": sec, "in_portfolio": t in held, "known": t in known})
+        out.sort(key=lambda x: (not x["ticker"].startswith(qq), x["ticker"]))
+        out = out[:12]
+        if qq and valid_ticker(qq) and qq not in pool:
+            out.append({"ticker": qq, "name": f"{qq} (any NSE symbol)", "sector": None, "in_portfolio": False,
+                        "known": False})
+        return {"results": out}
 
 
 @app.get("/api/companies/{ticker}")
-def company(ticker: str, s: Session = Depends(get_session)):
-    c = _ticker(s, ticker)
-    return {**_company_card(s, c, set(s.scalars(select(Holding.ticker)).all())), "about": c.about, "source": c.source}
+def company(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        c = s.get(Company, t)
+        if not c:
+            _404(f"Unknown company {t}")
+        rows = _price_rows(s, t)
+        held = bool(s.scalars(select(Holding).where(Holding.ticker == t)).first())
+        return {"ticker": c.ticker, "name": c.name, "sector": c.sector, "is_financial": c.is_financial, "about": c.about,
+                "source": c.source, "in_portfolio": held, "price": market.snapshot(rows) if rows else None,
+                "spark": [r.close for r in rows[-120:]]}
 
 
 @app.get("/api/companies/{ticker}/prices")
-def company_prices(ticker: str, days: int = Query(180, ge=5, le=800), s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    rows = market.series(s, ticker.upper(), days)
-    return {"ticker": ticker.upper(), "source": rows[-1].source if rows else None, "frequency": "EOD",
-            "rows": [{"date": r.date.isoformat(), "open": r.open, "high": r.high, "low": r.low, "close": r.close, "volume": r.volume} for r in rows]}
+def company_prices(ticker: str, days: int = Query(120, ge=5, le=400)):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        rows = _price_rows(s, t, days)
+        return {"ticker": t, "prices": [{"date": r.date.isoformat(), "close": r.close, "volume": r.volume,
+                                         "source": r.source} for r in rows]}
 
 
 @app.get("/api/companies/{ticker}/financials")
-def company_financials(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    ser = lambda ps: [{"label": p.label, "period_end": p.period_end.isoformat(), "basis": p.basis, "unit": p.unit, "metrics": p.metrics,  # noqa: E731
-                       "source": p.source, "source_url": p.source_url} for p in ps]
-    return {"ticker": ticker.upper(), "quarterly": ser(periods(s, ticker.upper(), "Q")), "annual": ser(periods(s, ticker.upper(), "Y")),
-            "latest_results": results_card(s, ticker.upper())}
+def company_financials(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        out = {}
+        for pt in ("Q", "Y"):
+            out["quarters" if pt == "Q" else "annual"] = [
+                {"period_end": p.period_end.isoformat(), "label": quarter_label(p.period_end) if pt == "Q" else p.label,
+                 "basis": p.basis, "unit": p.unit, "metrics": p.metrics, "source": p.source}
+                for p in results.periods(s, t, pt)]
+        return {"ticker": t, **out}
 
 
 @app.get("/api/companies/{ticker}/announcements")
-def company_announcements(ticker: str, limit: int = Query(30, le=200), s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    anns = s.scalars(select(Announcement).where(Announcement.ticker == ticker.upper()).order_by(Announcement.published_at.desc()).limit(limit)).all()
-    cos = {c.ticker: c for c in s.scalars(select(Company)).all()}
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    return [digest.serialize(a, cos, holdings) for a in anns]
+def company_announcements(ticker: str, limit: int = 30):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        c = s.get(Company, t)
+        rows = s.scalars(select(Announcement).where(Announcement.ticker == t)
+                         .order_by(Announcement.published_at.desc()).limit(limit)).all()
+        return {"ticker": t, "items": [D.serialize(a, c) for a in rows]}
 
 
-# ------------------------------------------------------------------ push: signals & digest
-
-def _triage(s: Session) -> dict:
-    m = s.get(Meta, "triage")
-    return dict(m.value) if m else {}
+# ---------------------------------------------------------------- push
+def _parse_dt(x: Optional[str]) -> Optional[datetime]:
+    if not x:
+        return None
+    try:
+        return datetime.fromisoformat(x)
+    except ValueError:
+        raise HTTPException(422, f"Bad date '{x}'")
 
 
 @app.get("/api/digest")
-def get_digest(
-    hours: int | None = Query(24, ge=1, le=24 * 90),
-    start: datetime | None = None,
-    end: datetime | None = None,
-    ticker: list[str] | None = Query(None),
-    sector: str | None = None,
-    category: list[str] | None = Query(None),
-    min_priority: Literal["critical", "high", "medium", "low"] | None = None,
-    s: Session = Depends(get_session),
-):
-    d = digest.build(s, hours=hours, start=start, end=end, tickers=ticker, sector=sector, categories=category, min_priority=min_priority)
-    tri = _triage(s)
-    for it in d["material"] + d["routine"]:
-        it["triage"] = tri.get(str(it["id"]))
-    d["data_mode"] = pipeline.data_mode(s)
-    return d
+def digest(hours: int = Query(24, ge=1, le=2160), start: Optional[str] = None, end: Optional[str] = None,
+           ticker: Optional[list[str]] = Query(None), sector: Optional[str] = None,
+           category: Optional[list[str]] = Query(None), min_priority: Optional[str] = None):
+    st, en = _parse_dt(start), _parse_dt(end)
+    if st and en and en < st:
+        raise HTTPException(422, "end is before start")
+    if st and en and en.time() == datetime.min.time() and len(end or "") <= 10:
+        en = en + timedelta(days=1) - timedelta(seconds=1)
+    with session_scope() as s:
+        return D.build(s, hours, st, en, [normalise(t) for t in ticker] if ticker else None, sector, category,
+                       min_priority)
 
 
 @app.get("/api/signals")
-def list_signals(
-    hours: int = Query(24 * 7, ge=1, le=24 * 365),
-    priority: list[str] | None = Query(None),
-    category: list[str] | None = Query(None),
-    ticker: str | None = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
-    s: Session = Depends(get_session),
-):
-    since = digest.anchor_time(s) - timedelta(hours=hours)
-    q = select(Announcement).where(Announcement.published_at >= since)
-    if priority:
-        q = q.where(Announcement.priority.in_(priority))
-    if category:
-        q = q.where(Announcement.category.in_(category))
-    if ticker:
-        q = q.where(Announcement.ticker == ticker.upper())
-    total = s.scalar(select(func.count()).select_from(q.subquery()))
-    rows = s.scalars(q.order_by(Announcement.score.desc(), Announcement.published_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
-    cos = {c.ticker: c for c in s.scalars(select(Company)).all()}
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    return {"items": [digest.serialize(a, cos, holdings) for a in rows], "page": page, "page_size": page_size, "total": total}
+def signals_list(hours: int = Query(168, ge=1, le=2160), priority: Optional[list[str]] = Query(None),
+                 category: Optional[list[str]] = Query(None), ticker: Optional[str] = None,
+                 page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    with session_scope() as s:
+        at = AL.anchor(s)
+        q = select(Announcement).where(Announcement.published_at >= at - timedelta(hours=hours),
+                                       Announcement.published_at <= at)
+        if priority:
+            q = q.where(Announcement.priority.in_(priority))
+        if category:
+            q = q.where(Announcement.category.in_(category))
+        if ticker:
+            q = q.where(Announcement.ticker == normalise(ticker))
+        rows = s.scalars(q.order_by(Announcement.score.desc())).all()
+        comps = {c.ticker: c for c in s.scalars(select(Company)).all()}
+        triage = get_meta(s, "triage", {}) or {}
+        page_rows = rows[(page - 1) * page_size: page * page_size]
+        return {"total": len(rows), "page": page, "page_size": page_size,
+                "items": [D.serialize(a, comps.get(a.ticker), triage.get(str(a.id))) for a in page_rows]}
 
 
-@app.get("/api/signals/{signal_id}")
-def get_signal(signal_id: int, s: Session = Depends(get_session)):
-    a = s.get(Announcement, signal_id)
-    if not a:
-        _404("signal not found")
-    cos = {c.ticker: c for c in s.scalars(select(Company)).all()}
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    d = digest.serialize(a, cos, holdings, full=True)
-    d["triage"] = _triage(s).get(str(a.id))
-    rows = market.series(s, a.ticker, 40)
-    d["price_context"] = [{"date": r.date.isoformat(), "close": r.close, "volume": r.volume} for r in rows]
-    d["related"] = [digest.serialize(x, cos, holdings) for x in s.scalars(
-        select(Announcement).where(Announcement.ticker == a.ticker, Announcement.id != a.id).order_by(Announcement.published_at.desc()).limit(5))]
-    return d
+@app.get("/api/signals/{sid}")
+def signal_detail(sid: int):
+    with session_scope() as s:
+        a = s.get(Announcement, sid)
+        if not a:
+            _404(f"Signal {sid} not found")
+        c = s.get(Company, a.ticker)
+        triage = (get_meta(s, "triage", {}) or {}).get(str(a.id))
+        out = D.serialize(a, c, triage, detail=True)
+        held = bool(s.scalars(select(Holding).where(Holding.ticker == a.ticker)).first())
+        out["in_portfolio"] = held
+        rows = _price_rows(s, a.ticker)
+        rd = signals.reaction_date(a.published_at)
+        idx = next((i for i, r in enumerate(rows) if r.date >= rd), len(rows))
+        ctx = rows[max(0, idx - 30): idx + 10]
+        out["price_context"] = {"filing_date": a.published_at.date().isoformat(), "reaction_date": rd.isoformat(),
+                                "prices": [{"date": r.date.isoformat(), "close": r.close, "volume": r.volume}
+                                           for r in ctx]}
+        rel = s.scalars(select(Announcement).where(Announcement.ticker == a.ticker, Announcement.id != a.id)
+                        .order_by(Announcement.published_at.desc()).limit(5)).all()
+        out["related"] = [D.serialize(r, c) for r in rel]
+        return out
 
 
 class Triage(BaseModel):
-    action: Literal["pin", "dismiss", "clear"]
+    action: str = Field(pattern="^(pin|dismiss|clear)$")
 
 
-@app.post("/api/signals/{signal_id}/triage")
-def triage(signal_id: int, body: Triage, s: Session = Depends(get_session)):
-    if not s.get(Announcement, signal_id):
-        _404("signal not found")
-    m = s.get(Meta, "triage") or Meta(key="triage", value={})
-    v = dict(m.value)
-    if body.action == "clear":
-        v.pop(str(signal_id), None)
-    else:
-        v[str(signal_id)] = body.action
-    m.value = v
-    s.merge(m)
-    s.commit()
-    return {"ok": True, "triage": v.get(str(signal_id))}
+@app.post("/api/signals/{sid}/triage")
+def signal_triage(sid: int, body: Triage):
+    with session_scope() as s:
+        if not s.get(Announcement, sid):
+            _404(f"Signal {sid} not found")
+        tri = get_meta(s, "triage", {}) or {}
+        if body.action == "clear":
+            tri.pop(str(sid), None)
+        else:
+            tri[str(sid)] = body.action
+        set_meta(s, "triage", tri)
+        return {"ok": True, "id": sid, "triage": tri.get(str(sid))}
 
 
-# ------------------------------------------------------------------ pull: research
-
+# ---------------------------------------------------------------- pull
 class Query_(BaseModel):
-    ticker: str = Field(min_length=1, max_length=20)
+    ticker: str
     question: str = Field(min_length=3, max_length=500)
 
 
 @app.post("/api/research/query")
-def research_query(body: Query_, s: Session = Depends(get_session)):
-    _ticker(s, body.ticker)
-    return answer.answer(s, body.ticker.upper(), body.question.strip())
+def research_query(body: Query_):
+    t = _ticker(body.ticker)
+    with session_scope() as s:
+        if not s.get(Company, t):
+            from ..services.pipeline import ensure_company
+            if ensure_company(s, t) is None:
+                _404(f"Unknown company {t}")
+        return R.answer(s, t, body.question)
+
+
+def _require_company(s, t):
+    c = s.get(Company, t)
+    if not c:
+        _404(f"Unknown company {t}. Add it from search to fetch its data.")
+    return c
 
 
 @app.get("/api/research/{ticker}")
-def research_overview(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    out = answer.overview(s, ticker.upper())
-    out["documents"] = _docs(s, ticker.upper())
-    out["ingestion"] = (s.get(Meta, f"ingest:{ticker.upper()}") or Meta(value={"status": "idle"})).value
-    out["data_mode"] = pipeline.data_mode(s)
-    return out
+def research_overview(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        c = _require_company(s, t)
+        docs = s.scalars(select(Document).where(Document.ticker == t)).all()
+        held = bool(s.scalars(select(Holding).where(Holding.ticker == t)).first())
+        rows = _price_rows(s, t)
+        return {"ticker": t, "name": c.name, "sector": c.sector, "is_financial": c.is_financial, "source": c.source,
+                "in_portfolio": held, "price": market.snapshot(rows) if rows else None,
+                "spark": [r.close for r in rows[-120:]], "overview": R.overview(s, t),
+                "documents": [_doc(s, d) for d in docs], "ingestion": get_meta(s, f"ingest:{t}"),
+                "data_mode": get_meta(s, "data_mode", "demo")}
 
 
-def _docs(s: Session, ticker: str) -> list[dict]:
-    docs = s.scalars(select(Document).where(Document.ticker == ticker).order_by(Document.period_end.desc())).all()
-    return [{"id": d.id, "doc_type": d.doc_type, "title": d.title, "period": d.period_label, "pages": d.pages, "status": d.status,
-             "error": d.error, "url": d.url, "source": d.source, "file": f"/api/documents/{d.id}/file" if d.local_path else None,
-             "chunks": len(d.chunks)} for d in docs]
+def _doc(s, d: Document) -> dict:
+    n = s.scalar(select(func.count()).select_from(Chunk).where(Chunk.document_id == d.id))
+    return {"id": d.id, "title": d.title, "doc_type": d.doc_type, "period": d.period_label, "pages": d.pages,
+            "passages": n, "status": d.status, "error": d.error, "url": d.url, "source": d.source,
+            "file_url": f"/api/documents/{d.id}/file" if d.local_path else None}
 
 
 @app.get("/api/research/{ticker}/documents")
-def research_documents(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    return _docs(s, ticker.upper())
+def research_documents(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        _require_company(s, t)
+        return {"ticker": t, "documents": [_doc(s, d) for d in s.scalars(select(Document).where(Document.ticker == t))],
+                "ingestion": get_meta(s, f"ingest:{t}")}
 
 
 @app.get("/api/research/{ticker}/management-guidance")
-def research_guidance(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    return guidance.scorecard(s, ticker.upper())
+def research_guidance(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        _require_company(s, t)
+        return G.scorecard(s, t)
 
 
 @app.get("/api/research/{ticker}/financial-health")
-def research_health(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    return health.analyse(s, ticker.upper())
+def research_health(ticker: str):
+    t = _ticker(ticker)
+    with session_scope() as s:
+        _require_company(s, t)
+        return H.assess(s, t)
 
 
 @app.get("/api/research/{ticker}/bull-bear")
-def research_bull_bear(ticker: str, s: Session = Depends(get_session)):
-    _ticker(s, ticker)
-    return answer.bull_bear(s, ticker.upper())
-
-
-def _bg_ingest(ticker: str, docs: bool = True) -> None:
+def research_bull_bear(ticker: str):
+    t = _ticker(ticker)
     with session_scope() as s:
-        s.merge(Meta(key=f"ingest:{ticker}", value={"status": "running", "at": datetime.utcnow().isoformat()}))
-        s.commit()
-        try:
-            from ..connectors import prices
+        _require_company(s, t)
+        return R.bull_bear(s, t)
 
-            pipeline.refresh_prices(s, [ticker])
-            res = pipeline.refresh_fundamentals(s, ticker, with_docs=docs)
-            s.merge(Meta(key=f"ingest:{ticker}", value={"status": "done", **res}))
+
+def _ingest_job(t: str) -> None:
+    from ..services import pipeline
+    with session_scope() as s:
+        set_meta(s, f"ingest:{t}", {"status": "running", "at": now_ist().isoformat(timespec="seconds")})
+    steps = {}
+    with session_scope() as s:
+        try:
+            pipeline.ensure_company(s, t)
+            steps["prices"] = pipeline.refresh_prices(s, [t])
         except Exception as e:
-            s.rollback()
-            s.merge(Meta(key=f"ingest:{ticker}", value={"status": "failed", "detail": str(e)[:300]}))
-        s.commit()
+            steps["prices"] = f"failed: {str(e)[:160]}"
+    with session_scope() as s:
+        try:
+            steps["fundamentals"] = pipeline.refresh_fundamentals(s, t, with_docs=True)
+        except Exception as e:
+            steps["fundamentals"] = f"failed: {str(e)[:160]}"
+    ok = not any(isinstance(v, str) and v.startswith("failed") for v in steps.values())
+    with session_scope() as s:
+        set_meta(s, f"ingest:{t}", {"status": "done" if ok else "failed", "steps": steps,
+                                    "at": now_ist().isoformat(timespec="seconds")})
 
 
 @app.post("/api/research/{ticker}/ingest", status_code=202)
-def research_ingest(ticker: str, bg: BackgroundTasks, s: Session = Depends(get_session)):
-    """Fetch fundamentals + annual report + last 4 transcripts for ANY NSE ticker, then index them."""
-    c = pipeline.ensure_company(s, ticker)
-    if not c:
-        raise HTTPException(422, detail={"error": "unknown_ticker", "detail": f"Could not resolve {ticker} (unknown symbol or data source unreachable)."})
-    bg.add_task(_bg_ingest, c.ticker, True)
-    return {"ok": True, "ticker": c.ticker, "status": "queued"}
+def research_ingest(ticker: str, bg: BackgroundTasks):
+    t = _ticker(ticker)
+    bg.add_task(_ingest_job, t)
+    return {"accepted": True, "ticker": t,
+            "note": "Fetching prices, screener.in financials and documents in the background."}
 
 
 @app.get("/api/documents/{doc_id}/file")
-def document_file(doc_id: int, s: Session = Depends(get_session)):
-    d = s.get(Document, doc_id)
-    if not d or not d.local_path or not Path(d.local_path).exists():
-        _404("document file not available")
-    return FileResponse(d.local_path, media_type="application/pdf", filename=Path(d.local_path).name, content_disposition_type="inline")
+def document_file(doc_id: int):
+    with session_scope() as s:
+        d = s.get(Document, doc_id)
+        if not d or not d.local_path:
+            _404("Document file not available")
+        p = Path(d.local_path)
+        if not p.exists():
+            parts = p.parts
+            if "docs" in parts:
+                p = settings.docs_dir.joinpath(*parts[len(parts) - parts[::-1].index("docs"):])
+        if not p.exists():
+            _404("Document file missing on this deployment")
+        return FileResponse(str(p), media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{p.name}"'})
 
 
-# ------------------------------------------------------------------ alerts
-
-def _rule(r: AlertRule) -> dict:
-    return {"id": r.id, "ticker": r.ticker, "kind": r.kind, "threshold": r.threshold, "category": r.category, "priority": r.priority,
-            "enabled": r.enabled, "description": alerts.describe(r)}
-
-
-@app.get("/api/alerts")
-def get_alerts(limit: int = Query(60, le=300), s: Session = Depends(get_session)):
-    rules = s.scalars(select(AlertRule).order_by(AlertRule.id)).all()
-    evs = s.execute(select(AlertEvent, AlertRule).join(AlertRule).order_by(AlertEvent.triggered_at.desc()).limit(limit)).all()
-    return {"rules": [_rule(r) for r in rules],
-            "events": [{"id": e.id, "rule_id": e.rule_id, "kind": r.kind, "priority": r.priority, "ticker": e.ticker, "at": e.triggered_at.isoformat(),
-                        "message": e.message, "value": e.value, "announcement_id": e.announcement_id, "seen": e.seen} for e, r in evs],
-            "unseen": s.scalar(select(func.count()).select_from(AlertEvent).where(AlertEvent.seen.is_(False))),
-            "monitoring": "Evaluated on each end-of-day refresh."}
-
-
+# ---------------------------------------------------------------- alerts
 class RuleIn(BaseModel):
-    ticker: str | None = None
-    kind: Literal["price_up", "price_down", "volume", "category"]
-    threshold: float | None = Field(None, gt=0, le=100)
-    category: str | None = None
-    priority: Literal["critical", "high", "medium", "low"] = "high"
+    kind: str = Field(pattern="^(price_up|price_down|volume|category)$")
+    threshold: Optional[float] = None
+    category: Optional[str] = None
+    ticker: Optional[str] = None
+    priority: str = Field("medium", pattern="^(critical|high|medium|low)$")
     enabled: bool = True
 
 
-@app.post("/api/alerts", status_code=201)
-def create_alert(body: RuleIn, s: Session = Depends(get_session)):
-    if body.kind == "category" and body.category not in CATEGORIES:
-        raise HTTPException(422, detail={"error": "bad_category", "detail": f"category must be one of {list(CATEGORIES)}"})
-    if body.kind != "category" and body.threshold is None:
-        raise HTTPException(422, detail={"error": "threshold_required", "detail": "price/volume alerts need a threshold"})
-    r = AlertRule(**body.model_dump())
-    r.ticker = r.ticker.upper() if r.ticker else None
-    s.add(r)
-    s.commit()
-    alerts.evaluate(s)
-    return _rule(r)
-
-
 class RulePatch(BaseModel):
-    threshold: float | None = Field(None, gt=0, le=100)
-    enabled: bool | None = None
-    priority: Literal["critical", "high", "medium", "low"] | None = None
+    threshold: Optional[float] = None
+    enabled: Optional[bool] = None
+    priority: Optional[str] = Field(None, pattern="^(critical|high|medium|low)$")
 
 
-@app.patch("/api/alerts/{rule_id}")
-def patch_alert(rule_id: int, body: RulePatch, s: Session = Depends(get_session)):
-    r = s.get(AlertRule, rule_id)
-    if not r:
-        _404("alert rule not found")
-    for k, v in body.model_dump(exclude_none=True).items():
-        setattr(r, k, v)
-    if body.threshold is not None:  # history for this rule is re-derived under the new threshold
-        s.query(AlertEvent).filter(AlertEvent.rule_id == r.id).delete()
-    s.commit()
-    alerts.evaluate(s)
-    return _rule(r)
+def _alerts_payload(s) -> dict:
+    rules = s.scalars(select(AlertRule).order_by(AlertRule.id)).all()
+    by_id = {r.id: r for r in rules}
+    evs = s.scalars(select(AlertEvent).order_by(AlertEvent.triggered_at.desc()).limit(200)).all()
+    return {"rules": [AL.serialize_rule(r) for r in rules],
+            "events": [AL.serialize_event(e, by_id.get(e.rule_id)) for e in evs],
+            "unseen": sum(1 for e in evs if not e.seen), "monitoring_note": AL.MONITORING_NOTE,
+            "categories": [{"key": k, "label": LABELS[k]} for k in IMPORTANCE if k != "unclassified"]}
 
 
-@app.delete("/api/alerts/{rule_id}")
-def delete_alert(rule_id: int, s: Session = Depends(get_session)):
-    r = s.get(AlertRule, rule_id)
-    if not r:
-        _404("alert rule not found")
-    s.query(AlertEvent).filter(AlertEvent.rule_id == r.id).delete()
-    s.delete(r)
-    s.commit()
-    return {"ok": True}
+@app.get("/api/alerts")
+def alerts_list():
+    with session_scope() as s:
+        return _alerts_payload(s)
+
+
+@app.post("/api/alerts")
+def alerts_create(body: RuleIn):
+    if body.kind == "category" and body.category not in IMPORTANCE:
+        raise HTTPException(422, "Unknown category for a category alert")
+    if body.kind != "category" and (body.threshold is None or body.threshold <= 0):
+        raise HTTPException(422, "Price and volume alerts need a positive threshold")
+    with session_scope() as s:
+        r = AlertRule(kind=body.kind, threshold=body.threshold if body.kind != "category" else None,
+                      category=body.category if body.kind == "category" else None,
+                      ticker=_ticker(body.ticker) if body.ticker else None, priority=body.priority,
+                      enabled=body.enabled, source="user")
+        s.add(r)
+        s.flush()
+        AL.evaluate(s)
+        return AL.serialize_rule(r)
+
+
+@app.patch("/api/alerts/{rid}")
+def alerts_patch(rid: int, body: RulePatch):
+    with session_scope() as s:
+        r = s.get(AlertRule, rid)
+        if not r:
+            _404(f"Alert rule {rid} not found")
+        if body.threshold is not None and r.kind != "category":
+            if body.threshold <= 0:
+                raise HTTPException(422, "Threshold must be positive")
+            if body.threshold != r.threshold:
+                r.threshold = body.threshold
+                AL.reset_rule_events(s, r.id)
+        if body.enabled is not None:
+            r.enabled = body.enabled
+        if body.priority:
+            r.priority = body.priority
+        s.flush()
+        AL.evaluate(s)
+        return AL.serialize_rule(r)
+
+
+@app.delete("/api/alerts/{rid}")
+def alerts_delete(rid: int):
+    with session_scope() as s:
+        r = s.get(AlertRule, rid)
+        if not r:
+            _404(f"Alert rule {rid} not found")
+        AL.reset_rule_events(s, r.id)
+        s.delete(r)
+        return {"ok": True}
 
 
 @app.post("/api/alerts/seen")
-def mark_seen(s: Session = Depends(get_session)):
-    s.query(AlertEvent).filter(AlertEvent.seen.is_(False)).update({"seen": True})
-    s.commit()
-    return {"ok": True}
+def alerts_seen():
+    with session_scope() as s:
+        for e in s.scalars(select(AlertEvent).where(AlertEvent.seen.is_(False))).all():
+            e.seen = True
+        return {"ok": True}
 
 
-# ------------------------------------------------------------------ settings
-
+# ---------------------------------------------------------------- settings
 @app.get("/api/settings/materiality")
-def get_weights(s: Session = Depends(get_session)):
-    m = s.get(Meta, "materiality_weights")
-    return {"weights": m.value if m else materiality.DEFAULT_WEIGHTS, "bands": materiality.BANDS}
+def get_weights():
+    with session_scope() as s:
+        return {"weights": M.normalise_weights(get_meta(s, "materiality_weights")), "defaults": M.DEFAULT_WEIGHTS,
+                "labels": M.COMPONENT_LABELS}
 
 
 class Weights(BaseModel):
-    category: float = Field(ge=0, le=1)
-    financial: float = Field(ge=0, le=1)
-    deviation: float = Field(ge=0, le=1)
-    relevance: float = Field(ge=0, le=1)
-    novelty: float = Field(ge=0, le=1)
+    weights: dict[str, float]
 
 
 @app.put("/api/settings/materiality")
-def put_weights(body: Weights, s: Session = Depends(get_session)):
-    w = body.model_dump()
-    tot = sum(w.values())
-    if tot <= 0:
-        raise HTTPException(422, detail={"error": "bad_weights", "detail": "weights must sum to > 0"})
-    w = {k: round(v / tot, 4) for k, v in w.items()}  # normalise to 1
-    s.merge(Meta(key="materiality_weights", value=w))
-    s.commit()
-    signals.process(s, force=True)
-    return {"weights": w}
+def put_weights(body: Weights):
+    w = M.normalise_weights(body.weights)
+    with session_scope() as s:
+        set_meta(s, "materiality_weights", w)
+        s.flush()
+        n = signals.process(s, force=True)
+        AL.evaluate(s)
+        return {"weights": w, "rescored": n}
 
 
-# ------------------------------------------------------------------ static frontend (single-URL deploy)
+# ---------------------------------------------------------------- SPA
+_dist = settings.frontend_dist
+if (_dist / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(_dist / "assets")), name="assets")
 
-if settings.frontend_dist.exists():
-    app.mount("/assets", StaticFiles(directory=settings.frontend_dist / "assets"), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def spa(full_path: str):
-        if full_path.startswith("api/"):
-            _404("no such endpoint")
-        f = settings.frontend_dist / full_path
-        if full_path and f.is_file():
-            return FileResponse(f)
-        return FileResponse(settings.frontend_dist / "index.html")
+@app.get("/{path:path}", include_in_schema=False)
+def spa(path: str):
+    if path.startswith("api/") or path == "api":
+        raise HTTPException(404, f"No API route /{path}")
+    f = _dist / path
+    if path and f.is_file() and _dist in f.resolve().parents:
+        return FileResponse(str(f))
+    index = _dist / "index.html"
+    if index.exists():
+        return FileResponse(str(index), headers={"Cache-Control": "no-cache"})  # hashed assets cache; the shell must not
+    return JSONResponse({"error": "not_found", "detail": "Frontend not built. Run: cd frontend && npm run build"},
+                        status_code=404)

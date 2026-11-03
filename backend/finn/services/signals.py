@@ -1,270 +1,315 @@
-"""Signal engine: turns raw filings into ranked, explained signals.
-
-classify -> dedupe -> enrich (results card / appointee bio / amounts) -> score -> explain
-"""
+"""Signal pipeline: classify -> dedupe/novelty -> enrich -> score -> summary -> why -> questions."""
 from __future__ import annotations
 
 import logging
 import re
 from datetime import datetime, timedelta
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import AlertRule, Announcement, Company, Holding, Meta
-from . import enrich, market, materiality, results, taxonomy
-from .numbers import fmt_pct, growth_pct
+from ..db import get_meta
+from ..models import AlertRule, Announcement, Company, FinancialPeriod, Holding, Price
+from ..research.periods import quarter_label
+from . import enrich, llm, materiality as M, market, results
+from . import numbers as N
+from .taxonomy import LABELS, classify, importance
 
 log = logging.getLogger("finn.signals")
 
+IMPLICATION = {
+    "results": "Results reset the earnings base the market prices off; a large YoY move usually re-rates estimates.",
+    "M&A": "A deal changes what the company owns; watch the price paid, how it is funded and how it shifts the mix.",
+    "management_change": "Leadership changes can shift strategy and capital allocation; an abrupt exit is a governance question.",
+    "fund_raise": "New capital means dilution or more debt; the use of proceeds decides whether it creates value.",
+    "litigation": "A legal or regulatory action can carry a cash cost and, for pharma, can block a plant's exports.",
+    "pledging": "Promoter pledging creates forced-selling risk if the share price falls.",
+    "capex": "Capex adds capacity ahead of demand; returns depend on utilisation and funding.",
+    "credit_rating": "Ratings move the cost of debt; a downgrade is a stress signal, a reaffirmation is not news.",
+    "bonus_split": "A bonus or split changes share count, not value.",
+    "insider_trading": "Insider sales or buys are weak signals alone but worth tracking in clusters.",
+    "press_release": "Order wins and launches matter in proportion to their size against revenue.",
+    "dividend": "A dividend returns cash; the size versus earnings says something about confidence.",
+    "earnings_call": "The transcript is where management's guidance and tone live; compare it with the numbers.",
+    "agm_egm": "Shareholder meetings are procedural unless the agenda carries a material resolution.",
+    "postal_ballot": "Postal ballots are procedural unless the resolution itself is material.",
+    "investor_meetings": "Investor meetings are scheduled; they rarely carry new information.",
+    "unclassified": "Routine compliance paperwork.",
+}
+
 QUESTIONS = {
-    "results": [
-        "Was the YoY change driven by volume, price or mix? (check the concall)",
-        "Did margins move because of input costs or one-offs/exceptional items?",
-        "How does this quarter compare with what management guided last quarter?",
-    ],
-    "management_change": [
-        "Is the departure planned succession or abrupt (check stated reason & effective date)?",
-        "Does the incoming person come from inside the company or a peer?",
-        "Any other KMP changes in the last 12 months?",
-    ],
-    "M&A": ["What valuation multiple is being paid?", "How is it funded — cash, debt or equity?", "Does it change the segment mix materially?"],
-    "fund_raise": ["How dilutive is it at the issue price?", "What is the stated use of proceeds?", "Is the balance sheet stretched (check D/E)?"],
-    "litigation": ["What is the maximum financial exposure vs. net worth?", "Is it provided for or a contingent liability?", "Is this a recurring dispute?"],
-    "credit_rating": ["What drove the rating action?", "Does it change borrowing costs on existing debt?"],
-    "pledging": ["What % of promoter holding is now pledged?", "Why does the promoter need the borrowing?"],
-    "capex": ["What is the capex vs. current gross block?", "Expected payback / commissioning timeline?", "Funded by internal accruals or debt?"],
-    "insider_trading": ["Size of the trade vs. the insider's total holding?", "Open-market or off-market?"],
-    "press_release": ["Is the order/contract size disclosed and material vs. revenue?", "Execution timeline?"],
-    "dividend": ["Payout ratio vs. history?", "Record date?"],
-    "bonus_split": ["No cash value change — check the record date for share-count adjustment."],
-    "earnings_call": ["Read the guidance section of the transcript (FINN extracts it in Research → Promise vs delivered)."],
-}
-
-IMPLICATIONS = {
-    "management_change": "Leadership transitions at CEO/CFO level can change capital-allocation and reporting priorities; markets often re-rate on the successor's track record.",
-    "M&A": "Could change the growth profile, segment mix and leverage depending on size and funding.",
-    "fund_raise": "Equity raises dilute existing holders; buybacks return cash; debt raises add leverage.",
-    "litigation": "Potential cash outflow or provision if the matter goes against the company.",
-    "credit_rating": "Rating changes affect the cost of borrowing and can signal lender views on balance-sheet strength.",
-    "pledging": "Rising promoter pledges raise the risk of forced selling if the share price falls.",
-    "capex": "Adds capacity and future revenue potential, at the cost of near-term free cash flow.",
-    "insider_trading": "Insider buying/selling can reflect views on valuation, though trades have many motives.",
-    "press_release": "Order wins add to revenue visibility if material relative to annual sales.",
-    "dividend": "Cash returned to shareholders; signals confidence in cash generation.",
-    "bonus_split": "No change to the company's value; may improve liquidity.",
-    "earnings_call": "Primary source for management guidance and tone.",
+    "results": ["Was the YoY change driven by volume, price or mix?",
+                "Did margins move because of input costs or one-offs/exceptional items?",
+                "How does this quarter compare with what management guided last quarter?"],
+    "management_change": ["Is the departure planned succession or abrupt?",
+                          "Does the incoming person come from inside the company or a peer?",
+                          "Any other KMP changes in the last 12 months?"],
+    "M&A": ["Is the valuation reasonable against the target's revenue and margins?",
+            "How is the deal funded (cash, debt or equity)?",
+            "How does the target change the revenue mix?"],
+    "fund_raise": ["How much dilution or extra leverage does this add?",
+                   "What is the stated use of proceeds?",
+                   "Where does debt-to-equity go after this?"],
+    "litigation": ["What is the maximum cash exposure?", "Has the company provided for it?",
+                   "Is this a repeat issue at the same unit or authority?"],
+    "credit_rating": ["What drove the rating action?", "Does the outlook change the cost of borrowing?",
+                      "How does leverage compare with the agency's trigger?"],
+    "pledging": ["What share of promoter holding is now pledged?", "At what price could margin calls start?",
+                 "Why does the promoter need the loan?"],
+    "capex": ["How is the capex funded?", "What utilisation is needed to earn its cost of capital?",
+              "When does the capacity start contributing revenue?"],
+    "insider_trading": ["Is this one person or a cluster of insiders?", "How large is it versus their holding?",
+                        "Was it inside a trading-window closure?"],
+    "press_release": ["How large is this against annual revenue?", "Is it new business or a renewal?",
+                      "What margin does this kind of work carry?"],
+    "dividend": ["What payout ratio does this imply?", "Is it in line with the stated dividend policy?",
+                 "Is the cash coming from operations?"],
+    "bonus_split": ["Does this signal anything beyond liquidity?", "What is the record date?",
+                    "Any change in the dividend per share after adjustment?"],
+    "earnings_call": ["What guidance did management give on this call?", "What did analysts push back on?",
+                      "Did any earlier guidance get revised?"],
 }
 
 
-def _tokens(s: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z]{3,}", s.lower()) if w not in {"the", "and", "for", "with", "under", "regulation", "sebi", "limited", "ltd"}}
+def _price_rows(s: Session, ticker: str) -> list[Price]:
+    return s.scalars(select(Price).where(Price.ticker == ticker).order_by(Price.date)).all()
 
 
-def _jaccard(a: set[str], b: set[str]) -> float:
-    return len(a & b) / len(a | b) if a and b else 0.0
-
-
-def _weights(s: Session) -> dict:
-    m = s.get(Meta, "materiality_weights")
-    return m.value if m else materiality.DEFAULT_WEIGHTS
-
-
-def process(s: Session, force: bool = False) -> int:
-    """Score every unprocessed announcement. Idempotent."""
-    q = select(Announcement).order_by(Announcement.published_at)
-    if not force:
-        q = q.where(Announcement.score.is_(None))
-    anns = s.scalars(q).all()
-    holdings = set(s.scalars(select(Holding.ticker)).all())
-    watched = {r.category for r in s.scalars(select(AlertRule).where(AlertRule.kind == "category", AlertRule.enabled)).all()}
-    weights = _weights(s)
-    price_cache: dict[str, list] = {}
-    n = 0
-    for a in anns:
-        try:
-            _process_one(s, a, holdings, watched, weights, price_cache)
-            n += 1
-        except Exception:  # one bad filing must never break the feed
-            log.exception("failed to process announcement %s", a.id)
-            a.category = a.category or "unclassified"
-            a.score, a.priority = 0, "low"
-    s.commit()
-    return n
-
-
-def _process_one(s: Session, a: Announcement, holdings, watched, weights, price_cache) -> None:
-    text = a.attachment_text or a.body or ""
-    c = taxonomy.classify(a.subject, a.exchange_category, text)
-    a.category, a.category_method = c.category, c.method
-    imp, imp_reason = taxonomy.subtype_importance(c.category, c.subtype, f"{a.subject} {text[:1500]}")
-
-    # --- dedupe & novelty against this company's earlier filings (90d) ---
-    prior = s.scalars(
-        select(Announcement).where(
-            Announcement.ticker == a.ticker,
-            Announcement.id != a.id,
-            Announcement.published_at < a.published_at,
-            Announcement.published_at >= a.published_at - timedelta(days=90),
-        )
-    ).all()
-    toks = _tokens(a.subject)
-    # novelty compares like with like: a results filing is not "old news" because its board-meeting notice came first
-    comparable = [p for p in prior if (p.enrichment or {}).get("subtype") in (None, c.subtype)]
-    sims = [(_jaccard(toks, _tokens(p.subject)), p) for p in comparable]
-    max_sim, twin = max(sims, key=lambda x: x[0], default=(0.0, None))
-    if twin and max_sim > 0.85 and (a.published_at - twin.published_at) < timedelta(days=2):
-        a.is_duplicate_of = twin.id
-    same_cat = [p for p in prior if p.category == c.category]
-    days_since = (a.published_at - max(p.published_at for p in same_cat)).days if same_cat else None
-
-    # --- enrichment ---
-    enrichment: dict = {"subtype": c.subtype}
-    card = None
-    if c.category == "results" and c.subtype != "board_notice":
-        card = _results_for(s, a)
-        if card:
-            enrichment["results"] = card
-    if c.category == "management_change":
-        enrichment["management"] = enrich.management_change(a.subject, text)
-    amount = enrich.extract_amount_cr(f"{a.subject} {text[:4000]}") if c.category not in ("results", "dividend") else None
-    if amount:
-        enrichment["amount_cr"] = amount
-
-    # --- components ---
-    annual = results.periods(s, a.ticker, "Y")
-    annual_rev = annual[-1].metrics.get("revenue") if annual else None
-    qs = results.periods(s, a.ticker, "Q")
-    yoy_hist = []
-    for i, q in enumerate(qs):
-        base = next((b for b in qs[:i] if b.period_end.year == q.period_end.year - 1 and b.period_end.month == q.period_end.month), None)
-        if base:
-            yoy_hist.append(growth_pct(q.metrics.get("pat"), base.metrics.get("pat")))
-    if card:
-        yoy_hist = yoy_hist[:-1]  # exclude the quarter being scored
-    if a.ticker not in price_cache:
-        price_cache[a.ticker] = market.series(s, a.ticker)
-    react = market.reaction(price_cache[a.ticker], a.published_at.date() + (timedelta(days=1) if a.published_at.hour >= 16 else timedelta(0)))
-    if react:
-        enrichment["reaction"] = react
-
-    comps = {
-        "category": materiality.Component(imp, imp_reason),
-        "financial": materiality.financial_impact(c.category, card, amount, annual_rev),
-        "deviation": materiality.deviation(card, yoy_hist[-8:], react),
-        "relevance": materiality.relevance(a.ticker in holdings, c.category in watched and c.subtype != "board_notice"),
-        "novelty": materiality.novelty(max_sim, days_since),
-    }
-    if c.subtype in taxonomy.SCHEDULED_SUBTYPES:
-        comps["novelty"] = materiality.Component(min(comps["novelty"].value, 30), "scheduled / recurring filing — expected, not news")
-    if imp < 40 and comps["deviation"].value > 25:
-        comps["deviation"] = materiality.Component(25, comps["deviation"].reason + " — capped: a low-importance filing is unlikely to explain the move")
-    if c.category == "unclassified":
-        comps["financial"] = materiality.Component(0, "routine filing")
-        comps["deviation"] = materiality.Component(min(comps["deviation"].value, 20), comps["deviation"].reason)
-        comps["novelty"] = materiality.Component(min(comps["novelty"].value, 10), "routine compliance paperwork")
-    total, breakdown = materiality.score(comps, weights)
-    if a.is_duplicate_of:
-        total = min(total, 10)
-        breakdown["duplicate_of"] = a.is_duplicate_of
-    a.score, a.priority, a.score_breakdown = total, materiality.priority_for(total), breakdown
-
-    a.summary, method = enrich.one_line_summary(a.subject, text, c.category)
-    if card:
-        a.summary = _results_sentence(card) or a.summary
-    enrichment["summary_method"] = method
-    enrichment["why"] = _explain(s, a, c.category, card, comps, same_cat, react, enrichment)
-    enrichment["questions"] = QUESTIONS.get(c.category, [])
-    a.enrichment = enrichment
-
-
-def _results_for(s: Session, a: Announcement) -> dict | None:
-    pages = (a.attachment_text or "").split("\f") if a.attachment_text else []
-    filing = results.parse_results_pages(pages) if pages else None
-    if pages and not filing:
-        filing = results.llm_parse_results(pages)
-    qs = results.periods(s, a.ticker, "Q")
-    cand = [q for q in qs if q.period_end <= a.published_at.date() and (a.published_at.date() - q.period_end).days <= 80]
-    if cand:
-        card = results.results_card(s, a.ticker, cand[-1].period_end)
-        return results.reconcile(card, filing) if card else None
-    if filing:
-        card = results.card_from_filing(filing, "Latest quarter", a.attachment_url)
-        card["verification"] = {"status": "single_source", "detail": f"Parsed from the filing (p.{filing['page']}, {filing['method']}); structured table not yet updated."}
-        return card
+def annual_revenue(s: Session, ticker: str, as_of: datetime) -> Optional[float]:
+    ys = [p for p in results.periods(s, ticker, "Y") if p.period_end <= as_of.date()]
+    if ys and (ys[-1].metrics or {}).get("revenue"):
+        return ys[-1].metrics["revenue"]
+    qs = [p for p in results.periods(s, ticker, "Q") if p.period_end <= as_of.date()][-4:]
+    if len(qs) == 4 and all((q.metrics or {}).get("revenue") for q in qs):
+        return sum(q.metrics["revenue"] for q in qs)
     return None
 
 
-def _results_sentence(card: dict) -> str | None:
-    r = {x["metric"]: x for x in card["rows"]}
+def reaction_date(published: datetime):
+    d = published.date()
+    if published.hour >= 16:
+        d = d + timedelta(days=1)
+    return d
 
-    def p(k):
-        v = r[k]["yoy_pct"]
-        return "N/A" if v is None else f"{v:+.1f}%"
 
-    if r["revenue"]["current"] is None:
+def _pat_z(s: Session, ticker: str, period_end) -> Optional[float]:
+    qs = results.periods(s, ticker, "Q")
+    by_end = {q.period_end: q for q in qs}
+    yoys: list[tuple[Any, float]] = []
+    for q in qs:
+        ya = next((x for e, x in by_end.items() if abs((q.period_end - timedelta(days=365) - e).days) <= 20), None)
+        g = N.growth_pct((q.metrics or {}).get("pat"), (ya.metrics or {}).get("pat") if ya else None)
+        if g is not None:
+            yoys.append((q.period_end, g))
+    cur = next((g for e, g in yoys if e == period_end), None)
+    hist = [g for e, g in yoys if e < period_end][-8:]
+    if cur is None or len(hist) < 3:
         return None
-    return f"{card['period']}: revenue {p('revenue')} YoY, PAT {p('pat')} YoY" + (
-        f"; EBITDA margin {card['margins']['ebitda_margin']:.1f}%" if card.get("margins", {}).get("ebitda_margin") is not None else ""
-    ) + "."
+    return N.zscore(cur, hist)
 
 
-def _explain(s: Session, a: Announcement, cat: str, card, comps, same_cat, react, enrichment) -> dict:
-    facts = [a.summary or a.subject]
+def _pick_quarter(s: Session, ticker: str, published: datetime) -> Optional[FinancialPeriod]:
+    qs = [q for q in results.periods(s, ticker, "Q")
+          if q.period_end <= published.date() and (published.date() - q.period_end).days <= 80]
+    return qs[-1] if qs else None
+
+
+def _clean_subject(subj: str) -> str:
+    t = re.sub(r"\s+", " ", subj or "").strip()
+    return t[:1].upper() + t[1:] if t else t
+
+
+def _llm_summary(a: Announcement, text: str) -> Optional[str]:
+    if not llm.available():
+        return None
+    out = llm.complete([
+        {"role": "system", "content": "Summarise an Indian exchange filing in ONE sentence of at most 28 words. "
+                                      "Concrete facts only (who, what, how much, when). No adjectives, no opinion."},
+        {"role": "user", "content": f"Company: {a.ticker}\nSubject: {a.subject}\n\n{text[:3000]}"},
+    ], tier="fast", max_tokens=80)
+    if not out:
+        return None
+    out = " ".join(out.split())
+    return out if len(out.split()) <= 34 else " ".join(out.split()[:28]) + "…"
+
+
+def _results_summary(card: dict) -> str:
+    r = {row["key"]: row for row in card["rows"]}
+    parts = [f"revenue {N.fmt_pct(r['revenue']['yoy'])} YoY", f"PAT {N.fmt_pct(r['pat']['yoy'])} YoY"]
+    tail = ""
+    if card["margins"].get("ebitda_margin") is not None:
+        tail = f"; EBITDA margin {card['margins']['ebitda_margin']:.1f}%"
+    return f"{card['period_label']}: " + ", ".join(parts) + tail + "."
+
+
+def _alerted_categories(s: Session, ticker: str) -> set[str]:
+    rules = s.scalars(select(AlertRule).where(AlertRule.kind == "category", AlertRule.enabled.is_(True))).all()
+    return {r.category for r in rules if r.ticker in (None, ticker)}
+
+
+def process_one(s: Session, a: Announcement, weights: dict, holdings: set[str]) -> None:
+    text = "\n".join(x for x in (a.subject, a.body or "", (a.attachment_text or "")[:4000]) if x)
+    cat, sub, method = classify(a.subject, a.exchange_category, a.body)
+    a.category, a.subtype, a.category_method = cat, sub, method
+    cat_score, cat_reason = importance(cat, sub, f"{a.subject} {a.body or ''}")
+    comp = s.get(Company, a.ticker)
+
+    # ---- dedupe + novelty (same company, previous 90 days)
+    prior = s.scalars(select(Announcement).where(
+        Announcement.ticker == a.ticker, Announcement.id != a.id,
+        Announcement.published_at <= a.published_at,
+        Announcement.published_at >= a.published_at - timedelta(days=90),
+        Announcement.category.is_not(None))).all()
+    toks = M.tokens(f"{a.subject} {(a.body or '')[:1000]}")
+    max_sim, dup_of, same_cat_14 = 0.0, None, False
+    for p in prior:
+        sim = M.jaccard(toks, M.tokens(f"{p.subject} {(p.body or '')[:1000]}"))
+        if sim > 0.85 and (a.published_at - p.published_at) <= timedelta(days=2) and dup_of is None:
+            dup_of = p.id
+        if p.subtype == sub:
+            max_sim = max(max_sim, sim)
+        if p.category == cat and (a.published_at - p.published_at) <= timedelta(days=14):
+            same_cat_14 = True
+    a.is_duplicate_of = dup_of
+
+    # ---- enrichment
+    enr: dict[str, Any] = {}
+    rev_yoy = pat_yoy = pat_z = None
+    card = None
+    if cat == "results" and sub != "board_notice":
+        pages = (a.attachment_text or "").split("\f") if a.attachment_text else []
+        filing = results.parse_results_pages(pages) if pages else None
+        if pages and filing is None:
+            filing = results.llm_read_page(pages)
+        q = _pick_quarter(s, a.ticker, a.published_at)
+        if q is not None:
+            card = results.results_card(s, a.ticker, q.period_end)
+            card["verification"] = results.reconcile(card, filing)
+            pat_z = _pat_z(s, a.ticker, q.period_end)
+        elif filing:
+            card = results.card_from_filing(filing, a.ticker, a.published_at.date(), bool(comp and comp.is_financial))
+        if card:
+            rows = {r["key"]: r for r in card["rows"]}
+            rev_yoy, pat_yoy = rows["revenue"]["yoy"], rows["pat"]["yoy"]
+            enr["results"] = card
+    people = []
+    if cat == "management_change":
+        people = enrich.management_change(text, comp.name if comp else a.ticker)
+        enr["people"] = people
+    amount = enrich.amount_cr(f"{a.subject}\n{a.body or ''}\n{(a.attachment_text or '')[:3000]}")
+    if amount:
+        enr["amount_cr"] = amount
+    rows = _price_rows(s, a.ticker)
+    react = market.reaction(rows, reaction_date(a.published_at)) if rows else None
+    enr["reaction"] = react
+    ann_rev = annual_revenue(s, a.ticker, a.published_at)
+
+    # ---- components and score
+    in_pf = a.ticker in holdings
+    comps = {
+        "category": {"value": cat_score, "reason": cat_reason},
+        "financial": M.financial(cat, sub, amount, ann_rev, rev_yoy, pat_yoy),
+        "deviation": M.deviation(cat_score, cat, pat_z, react),
+        "relevance": M.relevance(in_pf, cat in _alerted_categories(s, a.ticker), sub),
+        "novelty": M.novelty(max_sim, same_cat_14, sub, cat),
+    }
+    sc, breakdown = M.score(comps, weights)
+    if dup_of is not None:
+        sc = min(sc, 10.0)
+    a.score = sc
+    a.priority = M.priority(sc)
+    a.score_breakdown = breakdown
+
+    # ---- summary
+    if card:
+        a.summary = _results_summary(card)
+    elif cat != "unclassified" and dup_of is None and (s_llm := _llm_summary(a, text)):
+        a.summary = s_llm
+        enr["summary_method"] = "llm"
+    else:
+        a.summary = _clean_subject(a.subject)
+
+    # ---- why should I care
+    what: list[str] = []
     if card:
         for r in card["rows"]:
-            if r["current"] is not None:
-                facts.append(f"{r['label']} ₹{r['current']:,.0f} Cr — QoQ {fmt_pct(r['qoq_pct'])}, YoY {fmt_pct(r['yoy_pct'])}")
-    if "management" in enrichment:
-        for p in enrichment["management"]["people"]:
-            if p.get("name"):
-                facts.append(f"{p['name']} — {p.get('role') or 'role n/a'} ({p.get('change')})" + (f", effective {p['effective']}" if p.get("effective") else ""))
-    if enrichment.get("amount_cr"):
-        facts.append(f"Amount disclosed: ₹{enrichment['amount_cr']:,.0f} Cr")
-
-    implication = IMPLICATIONS.get(cat)
-    if card:
-        m = card.get("margins", {})
-        bps = m.get("ebitda_margin_change_bps_yoy")
-        implication = (
-            "Headline growth and margin direction set the tone for earnings estimates."
-            + (f" EBITDA margin {'expanded' if bps > 0 else 'contracted'} {abs(bps)} bps YoY." if bps else "")
-        )
-    fin = comps["financial"]
-    unusual = [comps["deviation"].reason, comps["novelty"].reason]
-    history = []
-    if same_cat:
-        history.append(f"{len(same_cat)} earlier '{cat}' filing(s) from this company in the last 90 days; most recent {max(p.published_at for p in same_cat):%d %b %Y}.")
-    else:
-        history.append("No similar filing from this company in the last 90 days.")
-    if card and card.get("trend"):
-        pats = [t["pat"] for t in card["trend"] if t.get("pat") is not None]
-        if len(pats) >= 4:
-            history.append(f"PAT over the last {len(pats)} quarters: " + ", ".join(f"{x:,.0f}" for x in pats) + " (₹ Cr).")
+            if r["current"] is None:
+                what.append(f"{r['label']}: N/A{' (' + r['note'].split(':')[0] + ')' if r.get('note') else ''}")
+            else:
+                what.append(f"{r['label']} {N.fmt_cr(r['current'])} — QoQ {N.fmt_pct(r['qoq'])}, YoY {N.fmt_pct(r['yoy'])}")
+    for p in people:
+        verb = {"joins": "joins as", "leaves": "leaves as", "retires": "retires as"}.get(p.get("change"), "")
+        what.append(f"{p['name']} {verb} {p.get('role') or 'officer'}" +
+                    (f", effective {p['effective']}" if p.get("effective") else ""))
+    if amount:
+        what.append(f"Amount disclosed: {N.fmt_cr(amount)}")
+    if not what:
+        what.append(_clean_subject(a.subject))
+    hist_same = [p for p in prior if p.category == cat]
+    trend = results.periods(s, a.ticker, "Q")[-8:]
     uncertain = []
-    if not a.attachment_text:
-        uncertain.append("Filing attachment text not available — summary is from the subject line only.")
-    if card and card.get("verification", {}).get("status") != "verified":
-        uncertain.append(card.get("verification", {}).get("detail", "Numbers from a single source."))
-    if card and card.get("flags"):
-        uncertain.extend(card["flags"])
-    if cat == "management_change":
-        uncertain.append("Bio is as disclosed in the filing; verify via the LinkedIn search link.")
-    if not react:
-        uncertain.append("No end-of-day market reaction available yet for this date.")
     if a.source == "demo":
-        uncertain.insert(0, "ILLUSTRATIVE DEMO DATA — not a real filing.")
-    return {
-        "what_happened": facts,
-        "implication": implication,
-        "implication_is_inference": True,
-        "is_it_unusual": unusual,
-        "financial_size": fin.reason,
-        "history": history,
+        uncertain.append("ILLUSTRATIVE DEMO DATA — not a real filing.")
+    if not a.attachment_text and cat not in ("unclassified",):
+        uncertain.append("No attachment text was read; the summary relies on the subject line.")
+    if card and card.get("verification", {}).get("status") not in ("verified",):
+        uncertain.append(f"Results not cross-verified: {card.get('verification', {}).get('detail')}")
+    if card:
+        uncertain += card.get("flags", [])
+    if people:
+        uncertain.append("Bio as disclosed by the company; not independently verified.")
+    if react is None:
+        uncertain.append("No end-of-day reaction yet (filed after the last session).")
+    enr["why"] = {
+        "what_happened": what,
+        "implication": IMPLICATION.get(cat, ""),
+        "is_it_unusual": [comps["deviation"]["reason"], comps["novelty"]["reason"]],
+        "financial_size": comps["financial"]["reason"],
+        "history": {"same_category_90d": len(hist_same),
+                    "last_same_category": max((p.published_at for p in hist_same), default=None),
+                    "pat_last_8q": [{"label": quarter_label(q.period_end), "pat": (q.metrics or {}).get("pat")}
+                                    for q in trend]},
         "uncertain": uncertain,
     }
+    enr["questions"] = QUESTIONS.get(cat, [])
+    enr["category_label"] = LABELS.get(cat, cat)
+    a.enrichment = _jsonable(enr)
 
 
-def company_name(s: Session, ticker: str) -> str:
-    c = s.get(Company, ticker)
-    return c.name if c else ticker
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, datetime):
+        return x.isoformat()
+    if hasattr(x, "isoformat"):
+        return x.isoformat()
+    return x
+
+
+def process(s: Session, force: bool = False) -> int:
+    weights = M.normalise_weights(get_meta(s, "materiality_weights"))
+    holdings = {h.ticker for h in s.scalars(select(Holding)).all()}
+    q = select(Announcement).order_by(Announcement.published_at, Announcement.id)
+    if force:
+        for a in s.scalars(select(Announcement)).all():
+            a.category = a.subtype = a.score = a.priority = None
+            a.is_duplicate_of = None
+        s.flush()
+    else:
+        q = q.where(Announcement.score.is_(None))
+    n = 0
+    for a in s.scalars(q).all():
+        try:
+            process_one(s, a, weights, holdings)
+            s.flush()
+            n += 1
+        except Exception as e:  # one bad filing never breaks the feed
+            log.exception("signal processing failed for %s", a.id)
+            a.category = a.category or "unclassified"
+            a.score, a.priority = 0.0, "low"
+            a.summary = _clean_subject(a.subject)
+            a.enrichment = {"error": str(e)}
+    return n

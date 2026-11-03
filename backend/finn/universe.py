@@ -1,38 +1,49 @@
-"""Seed universe: demo portfolio (20 NSE names, mixed sectors and sizes) + ad-hoc research names.
+"""Portfolio universe and ad-hoc research names. The engine itself works for any NSE symbol."""
+from __future__ import annotations
 
-The engine is ticker-driven: any NSE symbol can be added at runtime; this list only seeds names/sectors.
-Note: Tata Motors demerged in Oct 2025 — the listed passenger-vehicle entity trades as TMPV.
-"""
+import re
 
+TICKER_RE = re.compile(r"^[A-Z0-9&\-]{1,20}$")
+
+# (ticker, name, sector, is_financial)
 PORTFOLIO = [
-    ("RELIANCE", "Reliance Industries", "Energy & Conglomerate", False),
-    ("HDFCBANK", "HDFC Bank", "Banking", True),
-    ("ICICIBANK", "ICICI Bank", "Banking", True),
+    ("RELIANCE", "Reliance Industries Ltd", "Energy & Conglomerate", False),
+    ("HDFCBANK", "HDFC Bank Ltd", "Banking", True),
+    ("ICICIBANK", "ICICI Bank Ltd", "Banking", True),
     ("SBIN", "State Bank of India", "Banking", True),
-    ("INFY", "Infosys", "IT Services", False),
-    ("TCS", "Tata Consultancy Services", "IT Services", False),
-    ("KPITTECH", "KPIT Technologies", "IT Services", False),
-    ("TMPV", "Tata Motors Passenger Vehicles", "Automobiles", False),
-    ("MARUTI", "Maruti Suzuki India", "Automobiles", False),
-    ("M&M", "Mahindra & Mahindra", "Automobiles", False),
-    ("LT", "Larsen & Toubro", "Infrastructure", False),
-    ("ITC", "ITC", "FMCG", False),
-    ("HINDUNILVR", "Hindustan Unilever", "FMCG", False),
-    ("SUNPHARMA", "Sun Pharmaceutical Industries", "Pharmaceuticals", False),
-    ("BHARTIARTL", "Bharti Airtel", "Telecom", False),
-    ("NTPC", "NTPC", "Power", False),
-    ("TITAN", "Titan Company", "Consumer Discretionary", False),
-    ("ASIANPAINT", "Asian Paints", "Consumer Discretionary", False),
-    ("DIXON", "Dixon Technologies (India)", "Electronics Manufacturing", False),
-    ("POLYCAB", "Polycab India", "Capital Goods", False),
+    ("INFY", "Infosys Ltd", "IT Services", False),
+    ("TCS", "Tata Consultancy Services Ltd", "IT Services", False),
+    ("KPITTECH", "KPIT Technologies Ltd", "IT Services", False),
+    ("TMPV", "Tata Motors Passenger Vehicles Ltd", "Automobiles", False),
+    ("MARUTI", "Maruti Suzuki India Ltd", "Automobiles", False),
+    ("M&M", "Mahindra & Mahindra Ltd", "Automobiles", False),
+    ("LT", "Larsen & Toubro Ltd", "Infrastructure", False),
+    ("ITC", "ITC Ltd", "FMCG", False),
+    ("HINDUNILVR", "Hindustan Unilever Ltd", "FMCG", False),
+    ("SUNPHARMA", "Sun Pharmaceutical Industries Ltd", "Pharmaceuticals", False),
+    ("BHARTIARTL", "Bharti Airtel Ltd", "Telecom", False),
+    ("NTPC", "NTPC Ltd", "Power", False),
+    ("TITAN", "Titan Company Ltd", "Consumer Discretionary", False),
+    ("ASIANPAINT", "Asian Paints Ltd", "Consumer Discretionary", False),
+    ("DIXON", "Dixon Technologies (India) Ltd", "Electronics Manufacturing", False),
+    ("POLYCAB", "Polycab India Ltd", "Capital Goods", False),
 ]
 
-ADHOC = [
-    ("TRENT", "Trent", "Retail", False),
-    ("PERSISTENT", "Persistent Systems", "IT Services", False),
-    ("HAL", "Hindustan Aeronautics", "Defence", False),
-    ("BAJFINANCE", "Bajaj Finance", "NBFC", True),
-    ("DMART", "Avenue Supermarts", "Retail", False),
+RESEARCH = [
+    ("TRENT", "Trent Ltd", "Retail", False),
+    ("PERSISTENT", "Persistent Systems Ltd", "IT Services", False),
+    ("HAL", "Hindustan Aeronautics Ltd", "Defence", False),
+    ("BAJFINANCE", "Bajaj Finance Ltd", "NBFC", True),
+    ("DMART", "Avenue Supermarts Ltd", "Retail", False),
 ]
 
-ALL = PORTFOLIO + ADHOC
+ALL = PORTFOLIO + RESEARCH
+BY_TICKER = {t: (t, n, s, f) for (t, n, s, f) in ALL}
+
+
+def valid_ticker(t: str) -> bool:
+    return bool(TICKER_RE.match(t or ""))
+
+
+def normalise(t: str) -> str:
+    return (t or "").strip().upper().removesuffix(".NS").removesuffix(".BO")

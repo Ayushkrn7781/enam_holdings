@@ -3,7 +3,12 @@ services:
     name: finn
     runtime: docker
     plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /api/health
     envVars:
-      - key: GROQ_API_KEY
+      - key: FINN_DATA_DIR
+        value: /tmp/finn
+      - key: GEMINI_API_KEY
         sync: false

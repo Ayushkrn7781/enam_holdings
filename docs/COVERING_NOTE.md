@@ -3,30 +3,42 @@
 
 Dear ENAM team,
 
-Please find my submission for the FINN build challenge below. I am submitting after the 1 November deadline. [One line on why, or remove.]
+Please find my submission for the AI Engineer Build Challenge below.
 
-- **Prototype (open on a phone):** [Render URL]
-- **Repository:** [GitHub URL]
-- **AI build history:** [Claude share link / export], plus the commit history
+- **Prototype (open on a phone):** [LIVE_URL]
+- **Repository:** [GITHUB_URL]
+- **AI build history:** [BUILD_HISTORY_LINKS]
 
-**What I built.** FINN is a mobile-first triage tool for a 20-stock NSE portfolio. The morning *Brief* turns every filing into a ranked card deck: swipe right to pin, left once seen, tap for "Why should I care?". Each card shows its materiality score as a five-part strip (category, financial size, unusualness, relevance, novelty), so the ranking is never a black box. Results filings are parsed straight from the PDF and reconciled against the structured quarterly table, giving Revenue, EBITDA, PBT and PAT, QoQ and YoY. A management-change filing shows the incoming person's profile, read from the disclosure SEBI already requires. On the pull side, *Ask FINN* is docked on every screen and follows the company in view. Each question is routed to the right engine: structured maths, guidance grading, health rules, or retrieval over the annual report and concall transcripts. Every claim cites a document, page and speaker. The flagship view is **Promise vs delivered**: four calls of management guidance, quoted verbatim, graded against reported numbers, with revisions and repeated misses called out.
+**What I built.** FINN is a mobile-first agent with two modes.
+
+*Push* is a windowed brief of exchange filings across a 20-stock NSE portfolio.
+- Every filing gets an explainable materiality score: five rule-based components, each with a reason, shown as a strip on every card.
+- You triage the brief as a swipeable deck, and routine paperwork stays collapsed.
+- Results cards give Revenue, EBITDA, PBT and PAT, QoQ and YoY, verified against the filing PDF.
+- Management changes show the incoming person's background, read from the profile SEBI requires in the filing.
+- Threshold alerts are configurable.
+
+*Pull* is research on any NSE ticker, grounded only in annual reports, transcripts and reported financials. The headline workflow is **Promise vs delivered**: management's guidance from the last four calls, quoted verbatim and graded in code against what was reported, with revisions and repeated misses called out.
 
 **Key decisions.**
-1. Numbers never come from an LLM. Growth, margins, ratios and the score itself are computed in Python, and the results numbers come from two reconciled sources.
-2. Anti-hallucination by construction, not by prompt. Every number in an answer must appear in its cited excerpt, and every guidance quote must be found verbatim in the transcript. I tested this against a deliberately dishonest mock LLM, and both checks caught it.
-3. Cheap by default. Filings are classified by rules, the 8B model handles extraction, the 70B model is used only for synthesis, and every call goes through a content-addressed cache. The whole demo runs with zero API calls and the app works without any key.
-4. An explicit "I could not verify this" rather than a fluent guess.
+- The LLM never does arithmetic, and every number is computed in Python.
+- A deterministic router keeps numeric and guidance questions away from the model entirely.
+- Narrative answers must cite excerpts, and a verifier tags any sentence whose numbers are not in its sources.
+- The app runs with zero API keys, because every LLM step has a rules or extractive fallback.
+- With a Gemini free-tier key, Flash-Lite does bulk extraction and Flash does synthesis only. Responses are cached and throttled.
 
-**Trade-offs and what I left out.**
-- The deployed app runs on a clearly labelled *illustrative* dataset, because the exchanges and screener.in block cloud IPs. Real data loads with one command (`python -m finn.refresh`) from a normal connection, and it replaces the demo rows completely.
-- I chose SQLite + BM25 over Postgres + pgvector. Dense retrieval is optional.
-- There is no LinkedIn scraping, because of LinkedIn's terms.
-- Monitoring is end-of-day, with no real-time feed.
+**Trade-offs.**
+- SQLite instead of Postgres/pgvector, and BM25 with optional dense retrieval, to keep it one-command and free to host.
+- Exchange and screener sites often block cloud IPs, so the deployed demo runs on a clearly watermarked illustrative dataset with fictional people. A live refresh replaces it and never mixes the two.
 
-**Next.** Scheduled refresh with push notifications; segment-level guidance from investor presentations; and a relevance weight that learns from each investor's triage swipes.
+**What I left out.** BSE de-duplication, real-time intraday alerts, LinkedIn scraping (its terms forbid it), and lender-specific health metrics. Bank health is marked insufficient rather than guessed.
 
-The README covers the architecture, the scoring rules, the evaluation harness (27 curated questions) and a five-minute demo script.
+**Where I'd take it next.**
+- Scheduled ingestion with push notifications.
+- Segment-level guidance and KPI tracking.
+- Cross-call narrative-vs-numbers contradiction detection.
 
-Best regards,
-[Name]
-[Roll number / programme, IIT Kanpur]
+Thank you for your time.
+
+[NAME]
+[PHONE] · [EMAIL]
