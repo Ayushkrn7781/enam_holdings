@@ -17,4 +17,4 @@ ENV FRONTEND_DIST=/app/frontend/dist PORT=8000 FINN_DATA_DIR=/tmp/finn FINN_SNAP
     PYTHONUNBUFFERED=1
 WORKDIR /app/backend
 EXPOSE 8000
-CMD uvicorn finn.api.app:app --host 0.0.0.0 --port ${PORT}
+CMD ["sh", "-c", "exec uvicorn finn.api.app:app --host 0.0.0.0 --port ${PORT:-8000}"]

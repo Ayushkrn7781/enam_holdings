@@ -187,19 +187,26 @@ cmd_deploy() {
 
   if [ -n "$service_id" ]; then
     say "Updating service $service_id"
+    # Repair settings a hand-made service may have wrong (root directory, Dockerfile path).
+    local runtime
+    runtime="$(render GET "/services/$service_id" | json_get "(d.get('serviceDetails') or {}).get('runtime') or (d.get('serviceDetails') or {}).get('env')" 2>/dev/null || true)"
+    if [ -n "$runtime" ] && [ "$runtime" != "docker" ]; then
+      die "service '$SERVICE_NAME' uses the '$runtime' runtime and Render cannot switch it to Docker. Delete it (Dashboard > service > Settings > Delete) and re-run ./run.sh deploy."
+    fi
+    render PATCH "/services/$service_id" '{"rootDir":"","autoDeploy":"yes","serviceDetails":{"healthCheckPath":"/api/health","envSpecificDetails":{"dockerfilePath":"./Dockerfile","dockerContext":"."}}}' >/dev/null
     # Per-key updates, so a redeploy without a Gemini key never wipes the stored one.
     render PUT "/services/$service_id/env-vars/FINN_DATA_DIR" '{"value":"/tmp/finn"}' >/dev/null
     if [ -n "${GEMINI_API_KEY:-}" ]; then
       render PUT "/services/$service_id/env-vars/GEMINI_API_KEY" "{\"value\":\"$GEMINI_API_KEY\"}" >/dev/null
     fi
-    render POST "/services/$service_id/deploys" '{"clearCache":"do_not_clear"}' >/dev/null
+    render POST "/services/$service_id/deploys" '{"clearCache":"clear"}' >/dev/null
   else
     say "Creating Render web service $SERVICE_NAME"
     local env='[{"key":"FINN_DATA_DIR","value":"/tmp/finn"}'
     if [ -n "${GEMINI_API_KEY:-}" ]; then env="$env,{\"key\":\"GEMINI_API_KEY\",\"value\":\"$GEMINI_API_KEY\"}"; fi
     env="$env]"
     local body created
-    body="{\"type\":\"web_service\",\"name\":\"$SERVICE_NAME\",\"ownerId\":\"$owner_id\",\"repo\":\"$repo_url\",\"branch\":\"main\",\"autoDeploy\":\"yes\",\"envVars\":$env,\"serviceDetails\":{\"runtime\":\"docker\",\"plan\":\"free\",\"region\":\"singapore\",\"healthCheckPath\":\"/api/health\",\"envSpecificDetails\":{\"dockerfilePath\":\"./Dockerfile\",\"dockerContext\":\".\"}}}"
+    body="{\"type\":\"web_service\",\"name\":\"$SERVICE_NAME\",\"ownerId\":\"$owner_id\",\"repo\":\"$repo_url\",\"branch\":\"main\",\"rootDir\":\"\",\"autoDeploy\":\"yes\",\"envVars\":$env,\"serviceDetails\":{\"runtime\":\"docker\",\"plan\":\"free\",\"region\":\"singapore\",\"healthCheckPath\":\"/api/health\",\"envSpecificDetails\":{\"dockerfilePath\":\"./Dockerfile\",\"dockerContext\":\".\"}}}"
     created="$(render POST "/services" "$body")"
     service_id="$(printf '%s' "$created" | json_get "(d.get('service') or d).get('id')" 2>/dev/null || true)"
     if [ -z "$service_id" ]; then

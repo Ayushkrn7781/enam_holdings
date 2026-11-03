@@ -25,6 +25,16 @@ Open <http://localhost:8000> and use the browser's phone view; the layout is des
 | `./run.sh snapshot` | Rebuild the illustrative demo snapshot in `backend/seed` |
 | `./run.sh deploy` | Push to GitHub and deploy to Render's free plan. It prompts for `RENDER_API_KEY` and an optional `GEMINI_API_KEY`, and never writes either to disk |
 
+**Deploying by hand on Render:** use **New → Blueprint** on this repo, which reads [render.yaml](render.yaml). For a manual web service, use these settings:
+- Runtime: **Docker**
+- Root Directory: **empty**
+- Dockerfile Path: `./Dockerfile`
+- Docker Build Context: `.`
+- Health Check Path: `/api/health`
+- No build or start command
+
+A Python-runtime service can't be switched to Docker. Delete it and create it again. `./run.sh deploy` also repairs the root directory and Dockerfile path on an existing `finn` service.
+
 To turn on the language model, set `GEMINI_API_KEY` (free tier). See [.env.example](.env.example) for every variable.
 
 > **About the data.** The live connectors are built to the documented endpoints. NSE, screener.in and Yahoo often block cloud IPs, so out of the box FINN runs on a **clearly labelled illustrative demo dataset**:
